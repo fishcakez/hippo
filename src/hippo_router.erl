@@ -30,8 +30,8 @@ compile(MatchSpec) ->
       Reason :: not_found | {bad_handler, Other :: any}.
 run(Request, #spec{request_cms=CMS}) ->
    case ets:match_spec_run([Request], CMS) of
-        [{_, _, _} = Handler] ->
-            {ok, Handler};
+        [{Mod, Args}] ->
+            {init, Mod, Args};
         [] ->
             {error, not_found};
         [Other] ->

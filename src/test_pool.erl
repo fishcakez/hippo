@@ -11,8 +11,8 @@ start_link() ->
 
 init(_) ->
     MS = ets:fun2ms(fun(#hippo_request{path=Path, sockname={_, 8000}}) ->
-                            {test_statem, Path, []};
+                            {test_statem, Path};
                        (#hippo_request{path=Path, sockname={_, 8001}}) ->
-                            {test_chunk_statem, Path, []}
+                            {test_chunk_statem, Path}
                     end),
     {ok, MS}.

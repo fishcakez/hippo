@@ -1,1 +1,4 @@
-[].
+[{<<"elli_date">>,
+  {git,"https://github.com/knutin/elli_date.git",
+       {ref,"6f7a0a77b7fcd887cab68cc44bd3aa2bf4623c33"}},
+  0}].

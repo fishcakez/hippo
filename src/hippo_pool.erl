@@ -188,7 +188,7 @@ start_conns(Listener, Owner, Sock, Acceptors, State) ->
 start_conns(_, _, _, 0, Accepting, Conns) ->
     {Accepting, Conns};
 start_conns(Listener, Sock, Spec, N, Accepting, Conns) ->
-    {Pid, Ref} = hippo_conn:spawn_monitor(Sock, Spec),
+    {Pid, Ref} = hippo_statem:spawn_monitor(Sock, Spec),
     NAccepting = Accepting#{Ref => Listener},
     NConns = Conns#{Pid => Listener},
     start_conns(Listener, Sock, Spec, N-1, NAccepting, NConns).
@@ -197,7 +197,7 @@ start_conn(Listener, Accepting,
            #state{listeners=Listeners, spec=Spec, conns=Conns} = State) ->
     case Listeners of
         #{Listener := {_, Sock}} ->
-            {Pid, Ref} = hippo_conn:spawn_monitor(Sock, Spec),
+            {Pid, Ref} = hippo_statem:spawn_monitor(Sock, Spec),
             State#state{accepting=Accepting#{Ref => Listener},
                         conns=Conns#{Pid => Listener}};
         _ ->

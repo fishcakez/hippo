@@ -2,162 +2,201 @@
 
 -behaviour(gen_statem2).
 
--export([start_link/1]).
--export([start_link/2]).
-
--export([init_it/2]).
+-export([spawn_monitor/2]).
 -export([init_it/3]).
 -export([handle_event/4]).
 -export([format_status/2]).
 -export([code_change/4]).
 -export([terminate/3]).
 
--define(INIT_TIMEOUT, infinity).
 -define(REQUEST_TIMEOUT, 5000).
 
--record(init, {conn :: {pid(), reference()},
-               sock :: port(),
-               until = infinity :: integer() | infinity,
-               spec = await :: hippo_router:spec() | await,
-               next = await :: {pid(), reference()} | await}).
+-record(init, {starter :: pid(),
+               accept_ref :: reference(),
+               sock_ref :: non_neg_integer(),
+               spec :: hd_statem_router:spec()}).
 
--record(state, {req :: {headers, [{binary(), binary()}]} | chunk | async | done,
-                resp = await :: await | chunk | done,
-                next :: {pid(), reference()},
+-record(hippo, {headers = done :: [{binary(), binary()}] | done,
                 mode = handle_event_function :: gen_statem2:callback_mode(),
-                conn :: {pid(), reference()},
                 sock :: port(),
                 parser :: hippo_http:parse() | done,
-                mod :: module()}).
+                conn = close :: close | shutdown | {keep_alive,
+                                                    hippo_http:parse()},
+                spec :: hd_statem_router:spec()}).
 
--spec start_link(Sock) -> {ok, Pid, Ref} when
-      Sock :: port(),
+-spec spawn_monitor(LSock, Spec) -> {Pid, Ref} when
+      LSock :: port(),
+      Spec :: hippo_router:spec(),
       Pid :: pid(),
       Ref :: reference().
-start_link(Sock) ->
-    Ref = make_ref(),
-    Conn = {self(), Ref},
-    Pid = proc_lib:spawn_link(?MODULE, init_it, [Sock, Conn]),
-    {ok, Pid, Ref}.
+spawn_monitor(LSock, Spec) ->
+    SRef = make_ref(),
+    Pid = proc_lib:spawn_link(?MODULE, init_it, [SRef, LSock, Spec]),
+    ARef = monitor(process, Pid),
+    _ = Pid ! {ack, SRef, self(), ARef},
+    {Pid, ARef}.
 
--spec start_link(Parser, Sock) -> {ok, Pid, Ref} when
-      Parser :: hippo_http:parse(),
-      Sock :: port(),
-      Pid :: pid(),
-      Ref :: reference().
-start_link(Parser, Sock) ->
-    Ref = make_ref(),
-    Conn = {self(), Ref},
-    Pid = proc_lib:spawn_link(?MODULE, init_it, [Parser, Sock, Conn]),
-    {ok, Pid, Ref}.
-
--spec init_it(Sock, Conn) -> no_return() when
-      Sock :: port(),
-      Conn :: {pid(), reference()}.
-init_it(Sock, {_, Ref} = Conn) ->
-    InitState = #init{conn=Conn, sock=Sock},
+-spec init_it(SRef, LSock, Spec) -> no_return when
+      SRef :: reference(),
+      LSock :: port(),
+      Spec :: hippo_router:spec().
+init_it(SRef, LSock, Spec) ->
+    _ = process_flag(trap_exit, true),
     receive
-        {keep_alive, Ref, Parser} ->
-            init_parse(hippo_http:parse(Parser), InitState)
+        {ack, SRef, Starter, ARef} ->
+           {ok, Ref} = prim_inet:async_accept(LSock, -1),
+            Init = #init{spec=Spec, starter=Starter, accept_ref=ARef,
+                         sock_ref=Ref},
+            Opts = [], % [{debug, [trace]}],
+            gen_statem2:enter_loop(?MODULE, Opts, handle_event_function, accept,
+                                   Init, [])
     end.
 
--spec init_it(Parser, Sock, Conn) -> no_return() when
-      Parser :: hippo_http:parse(),
-      Sock :: port(),
-      Conn :: {pid(), reference()}.
-init_it(Parser, Sock, Conn) ->
-    InitState = #init{conn=Conn, sock=Sock},
-    init_recv(gen_tcp:recv(Sock, 0, ?INIT_TIMEOUT), Parser, InitState).
-
-handle_event(internal, {hippo_recv, _}, _,
-             {#state{req={headers, Headers}} = HippoState, StateData}) ->
-    NHippoState = HippoState#state{req=chunk},
-    keep_insert(NHippoState, StateData, {hippo_recv_headers, Headers});
-handle_event(internal, {hippo_recv, Timeout}, _,
-             {#state{req=chunk, parser=Parser, sock=Sock} = HippoState,
-              StateData}) ->
-    case parse(Parser, Sock, Timeout) of
-        {more, _, NParser} when Timeout == async ->
-            NHippoState = HippoState#state{req=async, parser=NParser},
-            {keep_state, {NHippoState, StateData}};
-        {chunk, Chunk, NParser} ->
-            NHippoState = HippoState#state{parser=NParser},
-            keep_insert(NHippoState, StateData, {hippo_recv_chunk, Chunk});
-        {trailers, Trailers, NParser} ->
-            NHippoState = HippoState#state{req=done, parser=NParser},
-            Event = {hippo_recv_trailers, Trailers},
-            keep_insert(NHippoState, StateData, Event);
-        {done, NParser} ->
-            NHippoState = req_done(NParser, HippoState),
-            keep_insert(NHippoState, StateData, hippo_recv_done);
-        {error, Reason, NParser} ->
-            NHippoState = recv_error(NParser, HippoState),
-            keep_insert(NHippoState, StateData, {hippo_recv_error, Reason})
+handle_event(info, {inet_async, _, Ref, {ok, Sock}}, accept,
+       #init{sock_ref=Ref, starter=Starter, accept_ref=ARef, spec=Spec}) ->
+    _ = Starter ! {'ACCEPT', ARef},
+    _ = inet_db:register_socket(Sock, inet_tcp),
+    {ok, PeerName} = inet:peername(Sock),
+    {ok, SockName} = inet:sockname(Sock),
+    ok = inet:setopts(Sock, [{active, once}]),
+    Parser = hippo_http:new(SockName, PeerName),
+    HippoData = #hippo{sock=Sock, spec=Spec, parser=Parser},
+    {next_state, await, HippoData};
+handle_event(info, {inet_async, LSock, Ref, {error, Reason}}, accept,
+             #init{sock_ref=Ref}) ->
+    gen_tcp:close(LSock),
+    {stop, {shutdown, {inet, Reason}}};
+handle_event(info, {tcp, Sock, Data}, await,
+             #hippo{sock=Sock, parser=Parser} = HippoData) ->
+   case request(hippo_http:parse(Data, Parser), Sock) of
+       {request, Request, Headers, NParser} ->
+           {keep_state, HippoData#hippo{parser=NParser},
+            {next_event, internal, {request, Request, Headers}}};
+       {error, Reason, NParser} ->
+           {keep_state, HippoData#hippo{parser=NParser},
+            {next_event, internal, {error, Reason}}}
+   end;
+handle_event(info, {tcp_closed, Sock}, await, #hippo{sock=Sock}) ->
+    {stop, {shutdown, {inet, closed}}};
+handle_event(info, {tcp_error, Sock, Reason}, await, #hippo{sock=Sock}) ->
+    {stop, {shutdown, {inet, Reason}}};
+handle_event(internal, {request, _Request, Headers}, await,
+             #hippo{spec=_Spec} = HippoData) ->
+    %case hippo_router:run(Request, Spec) of
+        %{init, _Mod, _Args} = Init ->
+            {keep_state, HippoData#hippo{headers=Headers},
+             {next_event, internal, {init, test_statem, []}}};
+        %{error, Reason} ->
+         %   {keep_state_and_data,
+          %   {next_event, internal, {error, {hippo_router, Reason}}}}
+    %end;
+handle_event(internal, {init, Mod, Args}, await, HippoData) ->
+    try Mod:init(Args) of
+        Result ->
+            init(Result, Mod, HippoData)
+    catch
+        throw:Result ->
+            init(Result, Mod, HippoData)
     end;
-handle_event(internal, {hippo_recv, _}, _, {#state{req=done}, _}) ->
-    {keep_state_and_data, {next_event, internal, hippp_recv_done}};
-handle_event(internal, {hippo_recv, _}, _, {#state{req=async}, _}) ->
-    {keep_state_and_data, {next_event, internal, hippo_recv_async}};
+handle_event(internal, {hippo_recv, Timeout}, _,
+             {StateData,
+              #hippo{headers=done, parser=Parser, sock=Sock} = HippoData}) ->
+    case parse(Parser, Sock, Timeout) of
+        {chunk, Chunk, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser},
+            keep_insert(NHippoData, StateData, {hippo_recv_chunk, Chunk});
+        {trailers, Trailers, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser},
+            Event = {hippo_recv_trailers, Trailers},
+            keep_insert(NHippoData, StateData, Event);
+        {done, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser},
+            keep_insert(NHippoData, StateData, hippo_recv_done);
+        {error, Reason, NParser} ->
+            NHippoData = recv_error(NParser, HippoData),
+            keep_insert(NHippoData, StateData, {hippo_recv_error, Reason})
+    end;
+handle_event(internal, {hippo_recv, _}, _,
+             {StateData, #hippo{headers=Headers} = HippoData}) ->
+    NHippoData = HippoData#hippo{headers=done},
+    keep_insert(NHippoData, StateData, {hippo_recv_headers, Headers});
 handle_event(internal, {hippo_send_response, Status, Headers, Body}, _,
-             {HippoState, StateData}) ->
-    case send_response(Status, Headers, Body, HippoState) of
-        {sent_response, NParser} when Body == chunk ->
-            NHippoState = HippoState#state{resp=chunk, parser=NParser},
-            keep_insert(NHippoState, StateData, hippo_sent_response);
-        {sent_response, NParser} ->
-            NHippoState = resp_done(NParser, HippoState),
-            keep_insert(NHippoState, StateData, hippo_sent_response);
+             {StateData, HippoData}) ->
+    case send_response(Status, Headers, Body, HippoData) of
+        {sent_response, Conn, NParser} when Body == chunk ->
+            NHippoData = HippoData#hippo{parser=NParser, conn=Conn},
+            keep_insert(NHippoData, StateData, hippo_sent_response);
+        {sent_response, Conn, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, conn=Conn},
+            keep_insert(NHippoData, StateData, hippo_sent_response);
         {error, {hippo_http,  Reason}, NParser} ->
-            send_stop(Reason, NParser, HippoState, StateData);
+            send_stop(Reason, NParser, HippoData, StateData);
         {error, Reason, _} ->
-            NHippoState = send_error(HippoState),
-            keep_insert(NHippoState, StateData, {hippo_send_error, Reason})
+            NHippoData = send_error(HippoData),
+            keep_insert(NHippoData, StateData, {hippo_send_error, Reason})
     end;
 handle_event(internal, {hippo_send_chunk, Chunk}, _,
-             {#state{sock=Sock, parser=Parser} = HippoState, StateData}) ->
+             {StateData, #hippo{sock=Sock, parser=Parser} = HippoData}) ->
     case send_chunk(Sock, Chunk, Parser) of
         {sent_chunk, NParser} ->
-            NHippoState = HippoState#state{parser=NParser},
-            keep_insert(NHippoState, StateData, hippo_sent_chunk);
+            NHippoData = HippoData#hippo{parser=NParser},
+            keep_insert(NHippoData, StateData, hippo_sent_chunk);
         {error, {hippo_http,  Reason}, NParser} ->
-            send_stop(Reason, NParser, HippoState, StateData);
+            send_stop(Reason, NParser, HippoData, StateData);
         {error, Reason, _} ->
-            NHippoState = send_error(HippoState),
-            keep_insert(NHippoState, StateData, {hippo_send_error, Reason})
+            NHippoData = send_error(HippoData),
+            keep_insert(NHippoData, StateData, {hippo_send_error, Reason})
    end;
 handle_event(internal, {hippo_send_last_chunk, Chunk}, _,
-             {#state{sock=Sock, parser=Parser} = HippoState, StateData}) ->
+             {#hippo{sock=Sock, parser=Parser} = HippoData, StateData}) ->
     case send_last_chunk(Sock, Chunk, Parser) of
         {sent_last_chunk, NParser} ->
-            NHippoState = resp_done(NParser, HippoState),
-            keep_insert(NHippoState, StateData, hippo_sent_last_chunk);
+            NHippoData = HippoData#hippo{parser=NParser},
+            keep_insert(NHippoData, StateData, hippo_sent_last_chunk);
         {error, {hippo_http,  Reason}, NParser} ->
-            send_stop(Reason, NParser, HippoState, StateData);
+            send_stop(Reason, NParser, HippoData, StateData);
         {error, Reason, _} ->
-            NHippoState = send_error(HippoState),
-            keep_insert(NHippoState, StateData, {hippo_send_error, Reason})
+            NHippoData = send_error(HippoData),
+            keep_insert(NHippoData, StateData, {hippo_send_error, Reason})
     end;
-handle_event(Type, Event, State,
-             {#state{mode=state_functions, mod=Mod} = HippoState, StateData}) ->
+handle_event(Type, Event, {Mod, State},
+             {StateData, #hippo{mode=state_functions} = HippoData}) ->
     try Mod:State(Type, Event, StateData) of
         Result ->
-            state_function(Result, HippoState)
+            state_function(Result, Mod, State, StateData, HippoData)
     catch
         throw:Result ->
-            state_function(Result, HippoState)
+            state_function(Result, Mod, State, StateData, HippoData)
     end;
-handle_event(Type, Event, State,
-             {#state{mode=handle_event_function, mod=Mod} = HippoState,
-              StateData}) ->
+handle_event(Type, Event, {Mod, State},
+             {StateData, #hippo{mode=handle_event_function} = HippoData}) ->
     try Mod:handle_event(Type, Event, State, StateData) of
         Result ->
-            handle_event_function(Result, HippoState)
+            handle_event_function(Result, Mod, State, StateData, HippoData)
     catch
         throw:Result ->
-            handle_event_function(Result, HippoState)
-    end.
+            handle_event_function(Result, Mod, State, StateData, HippoData)
+    end;
+handle_event(internal, {terminate, Reason}, {terminate, Mod, State},
+             {StateData, HippoData}) ->
+    try Mod:terminate(Reason, State, StateData) of
+        _ ->
+            flush(HippoData)
+    catch
+        throw:_ ->
+            flush(HippoData)
+   end;
+handle_event(cast, flushed, flush, #hippo{sock=Sock} = HippoData) ->
+    case inet:setopts(Sock, [{active, once}]) of
+        ok ->
+            {next_state, await, HippoData};
+        {error, Reason} ->
+            {stop, {shutdown, {inet, Reason}}, HippoData}
+    end;
+handle_event(_, _, flush, _) ->
+    keep_state_and_data.
 
-format_status(Opt, [PDict, State, {#state{mod=Mod}, StateData}]) ->
+format_status(Opt, [PDict, {Mod, State}, {StateData, _}]) ->
     case erlang:function_exported(Mod, format_status, 2) of
         true ->
             Mod:format_status(Opt, [PDict, State, StateData]);
@@ -165,9 +204,15 @@ format_status(Opt, [PDict, State, {#state{mod=Mod}, StateData}]) ->
             {State, StateData};
         false when Opt == normal ->
             [{data, [{"State", {State, StateData}}]}]
-    end.
+    end;
+format_status(terminate, [_, State, HippoData]) when is_atom(State) ->
+    {State, HippoData};
+format_status(normal, [_, State, HippoData]) when is_atom(State) ->
+    [{data, [{"State", {State, HippoData}}]}];
+format_status(Opt, [PDict, {terminate, Mod, State} | Data]) ->
+    format_status(Opt, [PDict, {Mod, State} | Data]).
 
-code_change(OldVsn, State, {#state{mod=Mod, mode=Mode} = HippoState, StateData},
+code_change(OldVsn, {Mod, State}, {StateData, #hippo{mode=Mode} = HippoState},
             Extra) ->
     try Mod:code_change(OldVsn, State, StateData, Extra) of
         {ok, NState, StateData} when Mode == state_functions, is_atom(NState) ->
@@ -181,151 +226,140 @@ code_change(OldVsn, State, {#state{mod=Mod, mode=Mode} = HippoState, StateData},
         throw:{ok, NState, StateData}
           when Mode == handle_event_function ->
             {ok, NState, {HippoState, StateData}}
-    end.
+    end;
+code_change(_, State, HippoState, _) when is_atom(State) ->
+    {ok, State, HippoState}.
 
-terminate(Reason, State, {#state{mod=Mod}, StateData}) ->
-    Mod:terminate(Reason, State, StateData).
+terminate(Reason, {Mod, State}, {StateData, _}) ->
+    Mod:terminate(Reason, State, StateData);
+terminate(_, State, _) when is_atom(State) ->
+    ok;
+terminate(_, {terminate, _, _}, _) ->
+    % Terminate raised an error/exit
+    ok.
 
 %% Internal
 
-init_parse({request, Request, Parser}, #init{sock=Sock} = InitState) ->
-    case hippo_http:parse(Parser) of
-        {headers, Headers, NParser} ->
-            loop_await(NParser, Request, Headers, InitState);
-        {more, _, NParser} ->
-            Recv = gen_tcp:recv(Sock, 0, ?INIT_TIMEOUT),
-            init_recv(Recv, NParser, Request, InitState)
+request({request, Request, Parser}, Sock) ->
+    headers(hippo_http:parse(Parser), Request, Sock);
+request({more, _, _} = More, Sock) ->
+    request(More, Sock, until());
+request({error, Reason, Parser}, _) ->
+    {error, {hippo_http, Reason}, Parser}.
+
+request({request, Request, Parser}, Sock, Until) ->
+    headers(hippo_http:parse(Parser), Request, Sock, Until);
+request({more, _, Parser}, Sock, Until) ->
+    case gen_tcp:recv(Sock, 0, timeout(Until)) of
+        {ok, Data} ->
+            request(hippo_http:parse(Data, Parser), Sock, Until);
+        {error, Reason} ->
+            {error, {inet, Reason}, Parser}
     end;
-init_parse({more, _, Parser}, #init{sock=Sock} = InitState) ->
-    init_recv(gen_tcp:recv(Sock, 0, ?INIT_TIMEOUT), Parser, InitState).
+request({error, Reason, Parser}, _, _) ->
+    {error, {hippo_http, Reason}, Parser}.
 
-init_parse({headers, Headers, NParser}, Request, InitState) ->
-    loop_await(NParser, Request, Headers, InitState);
-init_parse({more, _, NParser}, Request, InitState) ->
-    loop_await(NParser, Request, InitState).
+headers({headers, Headers, Parser}, Request, _) ->
+    {request, Request, Headers, Parser};
+headers({more, _, _} = More, Request, Sock) ->
+    headers(More, Request, Sock, until());
+headers({error, Reason, Parser}, _, _) ->
+    {error, {hippo_http, Reason}, Parser}.
 
-init_recv({ok, Data}, Parser, InitState) ->
-    case hippo_http:parse(Data, Parser) of
-        {request, Request, NParser} ->
-            init_parse(hippo_http:parse(NParser), Request, InitState);
-        {more, _, NParser} ->
-            loop_await(NParser, InitState)
-    end.
+headers({headers, Headers, Parser}, Request, _, _) ->
+    {request, Request, Headers, Parser};
+headers({more, _, Parser}, Request, Sock, Until) ->
+    case gen_tcp:recv(Sock, 0, timeout(Until)) of
+        {ok, Data} ->
+            headers(hippo_http:parse(Data, Parser), Request, Sock, Until);
+        {error, Reason} ->
+            {error, {inet, Reason}, Parser}
+    end;
+headers({error, Reason, Parser}, _, _, _) ->
+    {error, {hippo_http, Reason}, Parser}.
 
-init_recv({ok, Data}, Parser, Request, InitState) ->
-    case hippo_http:parse(Data, Parser) of
-        {headers, Headers, NParser} ->
-            loop_await(hippo_http:parse(NParser), Request, Headers, InitState);
-        {more, _, NParser} ->
-            loop_await(NParser, Request, InitState)
-    end.
+until() ->
+    erlang:monotonic_time(milli_seconds) + ?REQUEST_TIMEOUT.
 
-loop_await(Parser, #init{sock=Sock} = InitState) ->
-    NInitState = loop_await(InitState),
-    Recv = gen_tcp:recv(Sock, 0, ?REQUEST_TIMEOUT),
-    loop_recv(Recv, Parser, NInitState).
+timeout(Until) ->
+    max(Until - erlang:monotonitc_time(milli_seconds), 0).
 
-loop_await(Parser, Request, #init{sock=Sock} = InitState) ->
-    NInitState = loop_await(InitState),
-    Recv = gen_tcp:recv(Sock, 0, ?REQUEST_TIMEOUT),
-    loop_recv(Recv, Parser, Request, NInitState).
+init({Mode, State, StateData}, Mod, HippoData)
+  when Mode == state_functions, is_atom(State); Mode == handle_event_function ->
+    enter_loop(Mode, State, StateData, [], Mod, HippoData);
+init({Mode, State, StateData, Actions}, Mod, HippoData)
+  when Mode == state_functions, is_atom(State); Mode == handle_event_function ->
+    enter_loop(Mode, State, StateData, Actions, Mod, HippoData);
+init(ignore, Mod, _) ->
+    {keep_state_and_data, {next_event, internal, {error, {Mod, normal}}}};
+init({stop, Reason}, Mod, _) ->
+    {keep_state_and_data, {next_event, internal, {error, {Mod, Reason}}}};
+init(Other, Mod, _) ->
+    {keep_state_and_data,
+     {next_event, internal, {error, {Mod, {bad_return_value, Other}}}}}.
 
-loop_await(Parser, Request, Headers, InitState) ->
-    NInitState = loop_await(InitState),
-    loop_route(Parser, Request, Headers, NInitState).
+enter_loop(Mode, State, StateData, Actions, Mod, HippoState) ->
+    NHippoState = HippoState#hippo{mode=Mode},
+    {next_state, {Mod, State}, {StateData, NHippoState}, Actions}.
 
-loop_await(#init{conn={_, Ref}} = InitState) ->
-    receive
-        {keep_alive, Ref, Spec, Next} ->
-            InitState#init{spec=Spec, next=Next}
-    end.
+keep_insert(HippoData, StateData, Event) ->
+    {keep_state, {StateData, HippoData}, {next_event, internal, Event}}.
 
-loop_recv({ok, Data}, Parser, InitState) ->
-    case hippo_http:parse(Data, Parser) of
-        {request, Request, NParser} ->
-            loop_parse(hippo_http:parse(NParser), Request, InitState);
-        {more, _, NParser} ->
-            loop_recv(loop_recv(InitState), NParser, InitState)
-    end.
-
-loop_recv({ok, Data}, Parser, Request, InitState) ->
-    loop_parse(hippo_http:parse(Data, Parser), Request, InitState).
-
-loop_recv(#init{sock=Sock, until=Until}) ->
-    Timeout = max(Until - erlang:monotonic_time(milli_seconds), 0),
-    gen_tcp:recv(Sock, 0, Timeout).
-
-loop_parse({headers, Headers, Parser}, Request, InitState) ->
-    loop_route(Parser, Request, Headers, InitState);
-loop_parse({more, _, Parser}, Request, InitState) ->
-    loop_recv(loop_recv(InitState), Parser, Request, InitState).
-
-loop_route(Parser, Request, Headers, #init{spec=Spec} = InitState) ->
-    case hippo_router:run(Request, Spec) of
-        {ok, {Mod, Args, Opts}} ->
-            loop_init(Mod, Args, Opts, Parser, Headers, InitState)
-    end.
-
-loop_init(Mod, Args, Opts, Parser, Headers,
-          #init{sock=Sock, conn=Conn, next=Next}) ->
-    HippoState = #state{req={headers, Headers}, conn=Conn, sock=Sock, next=Next,
-                        parser=Parser, mod=Mod},
-    hippo_conn:request(Conn, Mod),
-    try Mod:init(Args) of
-        Result ->
-            loop_init(Result, HippoState, Opts)
-    catch
-        throw:Result ->
-            loop_init(Result, HippoState, Opts)
-    end.
-
-loop_init({Mode, State, StateData}, HippoState, Opts)
-  when Mode == state_functions; Mode == handle_event_function ->
-    enter_loop(Opts, State, HippoState#state{mode=Mode}, StateData, []);
-loop_init({Mode, State, StateData, StateOps}, HippoState, Opts)
-  when Mode == state_functions; Mode == handle_event_function ->
-    NHippoState = HippoState#state{mode=Mode},
-    enter_loop(Opts, State, NHippoState, StateData, StateOps);
-loop_init({stop, Reason}, _, _) ->
-    exit(Reason);
-loop_init(ignore, _, _) ->
-    exit(normal);
-loop_init(Other, _, _) ->
-    exit({bad_return_value, Other}).
-
-enter_loop(Opts, State, HippoState, StateData, Actions) ->
-    gen_statem2:enter_loop(?MODULE, Opts, handle_event_function, State,
-                           {HippoState, StateData}, self(), Actions).
-
-keep_insert(HippoState, StateData, Event) ->
-    {keep_state, {HippoState, StateData}, {next_event, internal, Event}}.
-
-state_function({next_state, State, StateData} = Result, HippoState)
+state_function({next_state, State, StateData}, Mod, _, _, HippoData)
   when is_atom(State) ->
-    setelement(3, Result, {HippoState, StateData});
-state_function({next_state, State, StateData, _} = Result, HippoState)
+    {next_state, {Mod, State}, {StateData, HippoData}};
+state_function({next_state, State, StateData, Actions}, Mod, _, _, HippoData)
   when is_atom(State) ->
-    setelement(3, Result, {HippoState, StateData});
-state_function(Other, HippoState) ->
-    common_state(Other, HippoState).
+    {next_state, {Mod, State}, {StateData, HippoData}, Actions};
+state_function(Other, Mod, State, StateData, HippoData) ->
+    common_state(Other, Mod, State, StateData, HippoData).
 
-handle_event_function({next_state, _, StateData} = Result, HippoState) ->
-    setelement(3, Result, {HippoState, StateData});
-handle_event_function({next_state, _, StateData, _} = Result, HippoState) ->
-    setelement(3, Result, {HippoState, StateData});
-handle_event_function(Other, HippoState) ->
-    common_state(Other, HippoState).
+handle_event_function({next_state, State, StateData}, Mod, _, _, HippoData) ->
+    {next_state, {Mod, State}, {StateData, HippoData}};
+handle_event_function({next_state, State, StateData, Actions}, Mod, _, _,
+                      HippoData) ->
+    {next_state, {Mod, State}, {StateData, HippoData}, Actions};
+handle_event_function(Other, Mod, State, StateData, HippoData) ->
+    common_state(Other, Mod, State, StateData, HippoData).
 
-common_state({keep_state, StateData}, HippoState) ->
-    {keep_state, {HippoState, StateData}};
-common_state({keep_state, StateData, _} = Result, HippoState) ->
-    setelement(2, Result, {HippoState, StateData});
-common_state({stop, _, StateData} = Result, HippoState) ->
-    setelement(3, Result, {HippoState, StateData});
-common_state({stop_and_reply, _, _, StateData} = Result, HippoState) ->
-    setelement(4, Result, {HippoState, StateData});
-common_state(Other, _) ->
+common_state({keep_state, StateData}, _, _, _, HippoData) ->
+    {keep_state, {HippoData, StateData}};
+common_state({keep_state, StateData, _} = Result, _, _, _, HippoData) ->
+    setelement(2, Result, {HippoData, StateData});
+common_state(stop, Mod, State, StateData, HippoData) ->
+    {next_state, {terminate, Mod, State}, {StateData, HippoData},
+     {next_event, internal, {terminate, normal}}};
+common_state({stop, normal, StateData}, Mod, State, _, HippoData) ->
+   {next_state, {terminate, Mod, State}, {StateData, HippoData},
+     {next_event, internal, {terminate, normal}}};
+common_state({stop, _, StateData} = Result, _, _, _, HippoData) ->
+    setelement(3, Result, {HippoData, StateData});
+common_state({stop_and_reply, normal, Replies}, Mod, State, StateData,
+             HippoData) ->
+    reply_then_stop(Replies, Mod, State, StateData, HippoData);
+common_state({stop_and_reply, normal, Replies, StateData}, Mod, State, _,
+             HippoData) ->
+    reply_then_stop(Replies, Mod, State, StateData, HippoData);
+common_state({stop_and_reply, _, _, StateData} = Result, _, _, _, HippoData) ->
+    setelement(4, Result, {HippoData, StateData});
+common_state(Other, _, _, _, _) ->
     Other.
+
+reply_then_stop(Replies, Mod, State, StateData, HippoData) ->
+    %% TODO: check replies are just replies!
+    {next_state, {terminate, Mod, State}, {StateData, HippoData},
+     Replies ++ [{next_event, internal, {terminate, normal}}]}.
+
+flush(#hippo{conn={keep_alive, Parser}} = HippoData) ->
+    %% TODO: include reference
+    gen_statem2:cast(self(), flushed),
+    NHippoData = HippoData#hippo{conn=close, parser=Parser},
+    {next_state, flush, NHippoData};
+flush(#hippo{conn=close}) ->
+    {stop, close};
+flush(#hippo{conn=shutdown, sock=Sock}) ->
+    _ = gen_tcp:shutdown(Sock, write),
+    {stop, shutdown_close}.
 
 parse(Parser, Sock, Timeout) ->
     case hippo_http:parse(Parser) of
@@ -349,34 +383,17 @@ recv_parse({ok, Buffer}, Parser) ->
 recv_parse({error, Reason}, Parser) ->
     {error, {inet, Reason}, Parser}.
 
-recv_error(Parser, #state{resp=Resp, conn=Conn} = HippoState) ->
-    case Resp of
-        done ->
-            hippo_conn:done(Conn, close),
-            HippoState#state{req=done, next=close, parser=done};
-        _ ->
-            HippoState#state{resp=done, parser=Parser}
-    end.
+recv_error(Parser, HippoData) ->
+    HippoData#hippo{parser=Parser}.
 
 send_response(Status, Headers, Body,
-              #state{sock=Sock, parser=Parser, next=Next}) ->
+              #hippo{sock=Sock, parser=Parser}) ->
     case hippo_http:response(Status, Headers, Body, Parser) of
         {response, Data, Connection, NParser} ->
-            next(Next, Connection),
-            send(Sock, Data, sent_response, NParser);
+            send(Sock, Data, {sent_response, Connection}, NParser);
         {error, Reason, NParser} ->
             {error, {hippo_http, Reason}, NParser}
     end.
-
-next({Pid, Ref}, {keep_alive, NextParser}) ->
-    _ = Pid ! {keep_alive, Ref, NextParser},
-    ok;
-next({Pid, Ref}, close) ->
-    _ = Pid ! {close, Ref},
-    ok;
-next({Pid, Ref}, shutdown) ->
-    _ = Pid ! {shutdown, Ref},
-    ok.
 
 send_chunk(Sock, Chunk, Parser) ->
     case hippo_http:chunk(Chunk, Parser) of
@@ -398,31 +415,18 @@ send_last_chunk(Sock, Chunk, Parser) ->
 
 send(Sock, Data, Result, Parser) ->
     case gen_tcp:send(Sock, Data) of
-        ok ->
+        ok when is_atom(Result) ->
             {Result, Parser};
+        ok when is_tuple(Result) ->
+            erlang:append_element(Result, Parser);
         {error, Reason} ->
             {error, {inet, Reason}, Parser}
     end.
 
-resp_done(_, #state{req=done} = HippoState) ->
-    done(HippoState);
-resp_done(Parser, HippoState) ->
-    HippoState#state{resp=done, parser=Parser}.
-
-req_done(_, #state{resp=done} = HippoState) ->
-    done(HippoState);
-req_done(Parser, HippoState) ->
-    HippoState#state{req=done, parser=Parser}.
-
-done(#state{conn=Conn} = HippoState) ->
-    hippo_conn:done(Conn),
-    HippoState#state{req=done, resp=done, parser=done}.
-
-send_error(#state{conn=Conn, sock=Sock} = HippoState) ->
+send_error(#hippo{sock=Sock} = HippoData) ->
     gen_tcp:close(Sock),
-    hippo_conn:done(Conn),
-    HippoState#state{req=done, resp=done, next=close, parser=done}. 
+    HippoData.
 
-send_stop(Reason, Parser, HippoState, StateData) ->
-    NHippoState = HippoState#state{parser=Parser},
-    {stop, {hippo_send_error, Reason}, {NHippoState, StateData}}.
+send_stop(Reason, Parser, HippoData, StateData) ->
+    NHippoData = HippoData#hippo{parser=Parser},
+    {stop, {hippo_send_error, Reason}, {StateData, NHippoData}}.

@@ -2,31 +2,17 @@
 
 -behaviour(gen_statem2).
 
--define(TIMEOUT, 5000).
-
 -export([init/1]).
--export([headers/3]).
--export([recv/3]).
 -export([send/3]).
 -export([code_change/4]).
 -export([terminate/3]).
 
 init(Path) ->
-    {state_functions, headers, Path,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}}.
-
-headers(_, {hippo_recv_headers,  _Headers}, StateData) ->
-    {next_state, recv, StateData,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}}.
-
-recv(_, {hippo_recv_chunk, _Chunk},  _) ->
-    {keep_state_and_data,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}};
-recv(_, hippo_recv_done, StateData) ->
-    Headers = [{<<"date">>, <<"Tue, 29 Mar 2016 23:29:38 GMT">>},
-               {<<"server">>, <<"Hippo">>}],
+    Headers = [{<<"date">>, elli_date()},
+               {<<"server">>, <<"Hippo">>},
+               {<<"content-type">>, <<"text/plain">>}],
     Body = <<"Hello World!">>,
-    {next_state, send, StateData,
+    {state_functions, send, Path,
      {next_event, internal, {hippo_send_response, 200, Headers, Body}}}.
 
 send(_, hippo_sent_response, _) ->
@@ -37,3 +23,11 @@ code_change(_, State, StateData, _) ->
 
 terminate(_, _, _) ->
     ok.
+
+elli_date() ->
+    case ets:lookup(elli_date, rfc1123) of
+        [{rfc1123, Date}] ->
+            Date;
+        [] ->
+            <<"">>
+    end.
