@@ -4,7 +4,7 @@
 -export([parse/1]).
 -export([parse/2]).
 -export([response/4]).
--export([error_response/1]).
+-export([error_response/2]).
 -export([chunk/2]).
 -export([last_chunk/2]).
 -export([status_error/1]).
@@ -15,9 +15,8 @@
 
 -define(MAX_LENGTH_SIZE, 64).
 
--type req() :: await_request | {request, non_neg_integer()} | await_headers |
-               headers | {continue, pos_integer() | chunked} |
-               {body, pos_integer()} |
+-type req() :: {request, non_neg_integer()} | await_headers | headers |
+               {continue, pos_integer() | chunked} | {body, pos_integer()} |
                await_chunk_line | chunk_line | {chunk_param, pos_integer()} |
                {chunk_body, pos_integer() | '\r\n' | '\n'} | trailers | failed |
                done.
@@ -29,7 +28,7 @@
                   report | mkactivity | checkout | merge | m_search | search |
                   notify | subscribe | unsubscribe | patch.
 
--type version() :: '1.0' | '1.1'.
+-type version() :: '0.9' | '1.0' | '1.1'.
 
 -type status() :: 100..102 | 200..208 | 226 | 300..308 | 400..419 | 421..424 |
                   426 | 428 | 429 | 431 | 451 | 500..508 | 510 | 511.
@@ -74,11 +73,12 @@
                  trailers = application:get_env(hippo, trailers, exclude),
                  http_1_0_connection = application:get_env(hippo,
                                                            http_1_0_connection,
-                                                           keep_alive)}).
+                                                           keep_alive),
+                 date = application:get_env(hippo, date, dirty)}).
 
 -record(parser, {config = #config{} :: #config{},
                  buffer :: binary() | done,
-                 req = await_request :: req(),
+                 req = {request, 0} :: req(),
                  resp = await_response :: resp(),
                  connection = undefined :: undefined | close | keep_alive |
                                            shutdown | upgrade | unknown |
@@ -115,8 +115,8 @@ new(SockName, PeerName) ->
       Done :: {done, NParser},
       More :: {more, non_neg_integer(), NParser},
       Error :: {error, error(), NParser}.
-parse(#parser{buffer=Buffer, req=await_request} = Parser) ->
-    request(Buffer, 0, 0, Parser);
+parse(#parser{buffer=Buffer, req={request, 0}} = Parser) ->
+    request(Buffer, 0, Parser);
 parse(#parser{req={request, _}} = Parser) ->
     {more, 0, Parser};
 parse(#parser{buffer=Buffer, req=await_headers} = Parser) ->
@@ -164,11 +164,8 @@ parse(#parser{buffer=done} = Parser) ->
       Error :: {error, error(), NParser}.
 parse(<<>>, Parser) ->
     parse(Parser);
-parse(Data, #parser{buffer=Buffer, req=await_request} = Parser) ->
-    request(merge(Data, Buffer), 0, 0, Parser);
 parse(Data, #parser{buffer=Buffer, req={request, Empty}} = Parser) ->
-    % \r could be last byte in Buffer
-    request(merge(Data, Buffer), max(byte_size(Buffer)-1, 0), Empty, Parser);
+    request(merge(Data, Buffer), Empty, Parser);
 parse(Data, #parser{buffer=Buffer, req=await_headers} = Parser) ->
     parse_headers(merge(Data, Buffer), 0, Parser);
 parse(Data, #parser{buffer=Buffer, req=headers} = Parser) ->
@@ -238,7 +235,7 @@ parse(_, #parser{buffer=done} = Parser) ->
 response(Status, Headers, chunk,
          #parser{resp=await_response, version='1.1'} = Parser) ->
     {Next, NParser} = next(Parser),
-    Data = [response(Status, Headers),
+    Data = [response(Status, Headers, NParser),
             <<"Transfer-Encoding: chunked\r\n">>,
             resp_connection(Next),
             $\r, $\n],
@@ -246,13 +243,13 @@ response(Status, Headers, chunk,
 response(Status, Headers, chunk,
          #parser{resp=await_response, version='1.0'} = Parser) ->
     {Next, NParser} = next(Parser#parser{resp=stream, connection=shutdown}),
-    Data = [response(Status, Headers),
+    Data = [response(Status, Headers, NParser),
             resp_connection(Next),
             $\r, $\n],
     {response, Data, Next, NParser};
 response(Status, Headers, Body, #parser{resp=await_response} = Parser) ->
     {Next, NParser} = next(Parser),
-    Data = [response(Status, Headers),
+    Data = [response(Status, Headers, NParser),
             resp_content_length(Body),
             resp_connection(Next),
             $\r, $\n |
@@ -263,22 +260,23 @@ response(_, _, _, #parser{resp=stream} = Parser) ->
 response(_, _, _, #parser{resp=Resp} = Parser) ->
     {error, Resp, Parser}.
 
--spec error_response(Status) -> iodata() when
-      Status :: status().
-error_response(Status) ->
-    [response(Status, [{<<"Connection">>, <<"close">>},
-                       {<<"Content-Length">>, <<"0">>}]), $\r, $\n].
+-spec error_response(Status, Parser) -> iodata() when
+      Status :: status(),
+      Parser :: parser().
+error_response(Status, Parser) ->
+    Headers = [{<<"Connection">>, <<"close">>},
+               {<<"Content-Length">>, <<"0">>}],
+    [response(Status, Headers, Parser), $\r, $\n].
 
--spec chunk(iodata(), Parser) ->  Chunk | More | Error when
+-spec chunk(iodata(), Parser) ->  Chunk | Error when
       Parser :: parser(),
       NParser :: parser(),
       Chunk :: {chunk, iodata(), NParser},
-      More :: {more, non_neg_integer(), NParser},
       Error :: {error, error(), NParser}.
 chunk(Data, #parser{resp=chunk} = Parser) ->
     case iolist_size(Data) of
         0 ->
-            {more, 0, Parser};
+            {chunk, <<>>, Parser};
         Len ->
             Chunk = [integer_to_binary(Len, 16), $\r, $\n, Data, $\r, $\n],
             {chunk, Chunk, Parser}
@@ -374,131 +372,108 @@ merge(Data, Buffer) when is_binary(Data) ->
 merge(Data, Buffer) ->
     iolist_to_binary([Buffer | Data]).
 
-request(Data, Start, Empty, #parser{config=Config} = Parser) ->
-    #config{crlf=CRLF, max_request_line=MaxReqLine,
-            max_empty_line=MaxEmpty} = Config,
-    MatchLen = min(byte_size(Data), MaxReqLine) - Start,
-    case binary:split(Data, CRLF, [{scope, {Start, MatchLen}}]) of
-        [_] when byte_size(Data) > MaxReqLine ->
-            {error, {request_line_too_long, Data}, fail(Parser)};
-        [_] ->
+request(Data, Empty, #parser{config=Config} = Parser) ->
+    #config{max_request_line=MaxReqLine, max_empty_line=MaxEmpty} = Config,
+    case erlang:decode_packet(http_bin, Data, [{line_length, MaxReqLine}]) of
+        {more, _} ->
             {more, 0, Parser#parser{buffer=Data, req={request, Empty}}};
-        [<<>>, _] when Empty + 2 > MaxEmpty ->
-            {error, {empty_line_too_long, Data}, fail(Parser)};
-        [<<>>, Rest] ->
-            <<_:2/binary, Rest/binary>> = Data,
-            request(Rest, 0, Empty+2, Parser);
-       [ReqLine, Rest] ->
-            parse_request(ReqLine, Rest, Config, Parser)
+        {ok, {http_request, _, _, {Major, Minor} = Vsn}, _}
+          when Vsn =/= {1, 1}, Vsn =/= {1, 0} ->
+            Vsn2 = <<"HTTP/", (Major+$0), $., (Minor+$0)>>,
+            req_error(unsupported_version, Vsn2, Parser);
+        {ok, {http_request, Method, {abs_path, Path}, Vsn}, Rest} ->
+            parse_request(Method, Path, Path, Vsn, Rest, Parser);
+        {ok, {http_request, Method, {absoluteURI, _, _, _, Path} = Abs, Vsn},
+         Rest} ->
+            parse_request(Method, Path, abs_uri(Abs), Vsn, Rest, Parser);
+        {ok, {http_request, 'OPTIONS', '*', {1, _} = Vsn}, Rest} ->
+            Request = #hippo_request{method=options, path='*', query=[],
+                                     uri= <<"*">>, version=version(Vsn)},
+            {request, Request, Parser#parser{req=await_headers, buffer=Rest}};
+        {ok, {http_request, _, '*', _}, _} ->
+            req_error(invalid_uri, <<$*>>, Parser);
+        {ok, {http_request, <<"CONNECT">>, {scheme, _, _}, {1,1}}, Rest} ->
+            ReqLen = byte_size(Data) - byte_size(Rest),
+            <<ReqLine:ReqLen/binary, _>> = Data,
+            req_error(not_implemented, ReqLine, Parser);
+        {ok, {http_request, _, {scheme, Host, Port}, _}, _} ->
+            req_error(invalid_uri, <<Host/binary, $:, Port/binary>>, Parser);
+        {ok, {http_error, <<"\r\n">>}, Rest} when Empty < MaxEmpty ->
+            request(Rest, Empty+2, Parser);
+        {ok, {http_error, <<"\r\n">>}, _} when Empty >= MaxEmpty ->
+            request(empty_line_too_long, <<"\r\n">>, Parser);
+        {ok, {http_error, ReqLine}, _} ->
+            req_error(bad_request_line, ReqLine, Parser);
+        {ok, {http_response, _, _, _}, Rest} ->
+             ReqLen = byte_size(Data) - byte_size(Rest),
+            <<ReqLine:ReqLen/binary, _>> = Data,
+            req_error(bad_request_line, ReqLine, Parser);
+        {error, _} ->
+            req_error(bad_request_line, Data, Parser)
     end.
 
-parse_request(ReqLine, Rest, Config, Parser) ->
-    case request_line(ReqLine, Config) of
-        {ok, #hippo_request{version=Version} = Request} ->
-            NParser = Parser#parser{buffer=Rest, version=Version,
-                                    req=await_headers},
+req_error(Reason, Value, Parser) ->
+    {error, {Reason, Value}, fail(Parser)}.
+
+parse_request(Method, Path, URI, Vsn, Rest, #parser{config=Config} = Parser) ->
+    Vsn2 = version(Vsn),
+    Method2 = method(Method),
+    case abs_path(Path) of
+        {ok, Path2, Query} when Method2 =/= unknown ->
+            #config{sockname=SockName, peername=PeerName} = Config,
+            Request = #hippo_request{method=Method2, path=Path2, query=Query,
+                                     uri=URI, version=Vsn2, sockname=SockName,
+                                     peername=PeerName},
+            NParser = Parser#parser{req=await_headers, version=Vsn2,
+                                    buffer=Rest},
             {request, Request, NParser};
+        {ok, _, _} when Method2 == unknown ->
+            {error, {unknown_method, Method}, fail(Parser)};
         {error, Reason} ->
-            {error, {Reason, ReqLine}, fail(Parser)}
+            {error, {Reason, Path}, fail(Parser)}
     end.
 
-request_line(ReqLine, Config) ->
-    case method(ReqLine) of
-        {ok, Method, Next} ->
-            request_line(Next, Method, Config);
-        {error, _} = Error ->
-            Error
-    end.
+abs_uri({absoluteURI, http, Host, undefined, Path}) ->
+    <<"http://", Host/binary, Path/binary>>;
+abs_uri({absoluteURI, http, Host, Port, Path}) ->
+    <<"http://", Host/binary, $:, (integer_to_binary(Port))/binary,
+      Path/binary>>;
+abs_uri({absoluteURI, https, Host, undefined, Path}) ->
+    <<"https://", Host/binary, Path/binary>>;
+abs_uri({absoluteURI, https, Host, Port, Path}) ->
+    <<"https://", Host/binary, $:, (integer_to_binary(Port))/binary,
+      Path/binary>>.
 
-request_line(RemLine, Method, Config) ->
-    Len = byte_size(RemLine) - byte_size(<<" HTTP/1.0">>),
-    case RemLine of
-        <<RawURI:Len/binary, " HTTP/1.0">> ->
-            request_line(RawURI, '1.0', Method, Config);
-        <<RawURI:Len/binary, " HTTP/1.1">> ->
-            request_line(RawURI, '1.1', Method, Config);
-        <<_:Len/binary, " HTTP/", X, $., Y>>
-          when X >= $0, X =< $9, Y >= $0, Y =< $9 ->
-            {error, unsupported_version};
-        _ ->
-            {error, bad_request_line}
-    end.
+version({1, 0}) -> '1.0';
+version({1, 1}) -> '1.1'.
 
-request_line(RawURI, Version, Method,
-             #config{sockname=SockName, peername=PeerName} = Config) ->
-    case uri(RawURI, Version, Method, Config) of
-        {ok, Path, Query} when is_atom(Method), Method =/= connect ->
-            Request = #hippo_request{version=Version, method=Method,
-                                     path=Path, query=Query, uri=RawURI,
-                                     sockname=SockName, peername=PeerName},
-            {ok, Request};
-        {ok, _, _} when element(1, Method) == unknown; Method == connect ->
-            {error, unknown_method};
-        {error, _} = Error ->
-            Error
-    end.
-
-method(<<"GET ", Rest/binary>>) -> {ok, get, Rest};
-method(<<"POST ", Rest/binary>>) -> {ok, post, Rest};
-method(<<"PUT ", Rest/binary>>) -> {ok, put, Rest};
-method(<<"HEAD ", Rest/binary>>) -> {ok, head, Rest};
-method(<<"DELETE ", Rest/binary>>) -> {ok, delete, Rest};
-method(<<"OPTIONS ", Rest/binary>>) -> {ok, options, Rest};
-method(<<"TRACE ", Rest/binary>>) -> {ok, trace, Rest};
-method(<<"COPY ", Rest/binary>>) -> {ok, copy, Rest};
-method(<<"LOCK ", Rest/binary>>) -> {ok, lock, Rest};
-method(<<"MKCOL ", Rest/binary>>) -> {ok, mkcol, Rest};
-method(<<"MOVE ", Rest/binary>>) -> {ok, move, Rest};
-method(<<"PURGE ", Rest/binary>>) -> {ok, purge, Rest};
-method(<<"PROPFIND ", Rest/binary>>) -> {ok, propfind, Rest};
-method(<<"PROPPATCH ", Rest/binary>>) -> {ok, proppatch, Rest};
-method(<<"UNLOCK ", Rest/binary>>) -> {ok, unlock, Rest};
-method(<<"REPORT ", Rest/binary>>) -> {ok, report, Rest};
-method(<<"MKACTIVITY ", Rest/binary>>) -> {ok, mkactivity, Rest};
-method(<<"CHECKOUT ", Rest/binary>>) -> {ok, checkout, Rest};
-method(<<"MERGE ", Rest/binary>>) -> {ok, merge, Rest};
-method(<<"M-SEARCH ", Rest/binary>>) -> {ok, m_search, Rest};
-method(<<"SEARCH ", Rest/binary>>) -> {ok, search, Rest};
-method(<<"NOTIFY ", Rest/binary>>) -> {ok, notify, Rest};
-method(<<"SUBSCRIBE ", Rest/binary>>) -> {ok, subscribe, Rest};
-method(<<"UNSUBSCRIBE ", Rest/binary>>) -> {ok, unsubscribe, Rest};
-method(<<"PATCH ", Rest/binary>>) -> {ok, patch, Rest};
-method(<<"CONNECT ", Rest/binary>>) -> {ok, connect, Rest};
-method(<<Other/binary>>) ->
-    case binary:split(Other, <<" ">>) of
-        [_] ->
-            {error, bad_request_line};
-        [<<>>, _] ->
-            {error, bad_request_line};
-        [Method, Rest] ->
-            {ok, {unknown, Method}, Rest}
-    end.
-
-uri(Long, _, _, #config{max_uri=MaxURI}) when byte_size(Long) > MaxURI ->
-    {error, uri_too_long};
-uri(<<>>, _, _, _) ->
-    {error, bad_request_line};
-uri(<<"*">>, _, _, _) ->
-    {ok, '*', []};
-uri(<<$/, Rest/binary>>, _, _, _) ->
-    abs_path(Rest);
-uri(<<H, T1, T2, P, "://", Rest/binary>>, _, _, _)
-  when (H =:= $h orelse H =:= $H),
-       (T1 =:= $t orelse T1 =:= $T),
-       (T2 =:= $t orelse T2 =:= $T),
-       (P =:= $p orelse P =:= $P) ->
-    abs_uri(Rest);
-uri(<<H, T1, T2, P, S, "://", Rest/binary>>, _, _, _)
-  when (H =:= $h orelse H =:= $H),
-       (T1 =:= $t orelse T1 =:= $T),
-       (T2 =:= $t orelse T2 =:= $T),
-       (P =:= $p orelse P =:= $P),
-       (S =:= $s orelse S =:= $s) ->
-    abs_uri(Rest);
-uri(Other, '1.1', connect, _) ->
-    authority(Other);
-uri(_, _, _, _) ->
-    {error, invalid_uri}.
+method('GET') -> get;
+method('POST') -> post;
+method('PUT') -> put;
+method('HEAD') -> head;
+method('DELETE') -> delete;
+method('OPTIONS') -> options;
+method('TRACE') -> trace;
+method(<<"COPY">>) -> copy;
+method(<<"LOCK">>) -> lock;
+method(<<"MKCOL">>) -> mkcol;
+method(<<"MOVE">>) -> move;
+method(<<"PURGE">>) -> purge;
+method(<<"PROPFIND">>) -> propfind;
+method(<<"PROPPATCH">>) -> proppatch;
+method(<<"UNLOCK">>) -> unlock;
+method(<<"REPORT">>) -> report;
+method(<<"MKACTIVITY">>) -> mkactivity;
+method(<<"CHECKOUT">>) -> checkout;
+method(<<"MERGE">>) -> merge;
+method(<<"M-SEARCH">>) -> m_search;
+method(<<"SEARCH">>) -> search;
+method(<<"NOTIFY">>) -> notify;
+method(<<"SUBSCRIBE">>) -> subscribe;
+method(<<"UNSUBSCRIBE">>) -> unsubscribe;
+method(<<"PATCH">>) -> patch;
+method(<<"CONNECT">>) -> connect;
+method(Other) when is_binary(Other) -> unknown.
 
 abs_path(RawPath) ->
     abs_path(RawPath, <<>>, []).
@@ -624,76 +599,117 @@ query(<<>>, Key, key, Query) ->
 query(<<>>, Value, Key, Query) ->
     {ok, lists:reverse(Query, [{Key, Value}])}.
 
-abs_uri(<<>>) ->
-    {error, invalid_uri};
-abs_uri(<<$/, Path/binary>>) ->
-    abs_path(Path);
-abs_uri(<<$?, RawQuery/binary>>) ->
-    query(RawQuery, []);
-abs_uri(<<$\s, _/binary>>) ->
-    {error, bad_request_line};
-abs_uri(<<_, Rest/binary>>) ->
-    abs_uri(Rest).
-
-authority(Auth) ->
-    case binary:match(Auth, [<<"/">>, <<"?">>, <<$\s>>]) of
-        nomatch ->
-            authority_server(Auth);
-        _ ->
-            {error, invalid_uri}
-    end.
-
-authority_server(Auth) ->
-    case binary:split(Auth, <<"@">>, [global]) of
-        [_] ->
-            authority_port(Auth);
-        [_, Server] ->
-            authority_port(Server);
-        _ ->
-            {error, invalid_uri}
-    end.
-
-authority_port(Server) ->
-    case binary:split(Server, <<":">>) of
-        [_] ->
-            {error, authority_uri};
-        [_, RawPort] when byte_size(RawPort) =< byte_size(<<"65535">>) ->
-            parse_authority_port(RawPort);
-        _ ->
-            {error, invalid_uri}
-    end.
-
-parse_authority_port(RawPort) ->
-    try binary_to_integer(RawPort) of
-        Port when Port >= 1, Port =< 65535 ->
-            {error, authority_uri};
-        _ ->
-            {error, invalid_uri}
-    catch
-        error:badarg ->
-            {error, invalid_uri}
-    end.
-
 parse_headers(<<"\r\n", Rest/binary>>, 0, Parser) ->
     {headers, [], done(Rest, Parser)};
 parse_headers(Data, Start, #parser{config=Config} = Parser) ->
     #config{crlf2=CRLF2, max_headers=MaxHeaders} = Config,
     Len = min(byte_size(Data), MaxHeaders) - Start,
-    case binary:split(Data, CRLF2, [{scope, {Start, Len}}]) of
-        [_] when byte_size(Data) > MaxHeaders ->
+    case binary:match(Data, CRLF2, [{scope, {Start, Len}}]) of
+        nomatch when byte_size(Data) > MaxHeaders ->
             {error, {headers_too_long, Data}, fail(Parser)};
-        [_] ->
+        nomatch ->
             {more, 0, Parser#parser{buffer=Data, req=headers}};
-        [RawHeaders, Rest] ->
-            parse_headers(RawHeaders, Parser#parser{buffer=Rest})
+        {Pos, 4} ->
+            HeadLen = Pos + 4,
+            <<RawHeaders:HeadLen/binary, Rest/binary>> = Data,
+            headers(RawHeaders, [], #body{}, Parser#parser{buffer=Rest})
     end.
 
-parse_headers(RawHeaders, Parser) ->
-    case headers(RawHeaders, [], #body{}, Parser) of
-        {ok, Headers, Body, NParser} ->
-            handle_headers(Headers, Body, NParser);
-        {error, Reason} ->
-            {error, Reason, fail(Parser)}
+headers(Buffer, Headers, Body, Parser) ->
+    case erlang:decode_packet(httph_bin, Buffer, []) of
+        {ok, {http_header, _, 'Connection', _, Value}, Rest} ->
+            connection(header_value(Value), Rest, Headers, Body, Parser);
+        {ok, {http_header, _, 'Content-Length', _, Value}, Rest} ->
+            content_length(header_value(Value), Rest, Headers, Body, Parser);
+        {ok, {http_header, _, 'Transfer-Encoding', _, Value}, Rest} ->
+            transfer_encoding(header_value(Value), Rest, Headers, Body, Parser);
+        {ok, {http_header, _, <<"Expect">>, _, Value}, Rest} ->
+            expect(header_value(Value), Rest, Headers, Body, Parser);
+        {ok, {http_header, _, Key, _, Value}, Rest} ->
+            Header = {header_key(Key), header_value(Value)},
+            headers(Rest, [Header | Headers], Body, Parser);
+        {ok, http_eoh, <<>>} ->
+            handle_headers(lists:reverse(Headers), Body, Parser);
+        {ok, {http_error, Line}, _} ->
+            {error, {bad_header_line, Line}, fail(Parser)}
+    end.
+
+header_key('Accept') -> <<"accept">>;
+header_key('Accept-Charset') -> <<"accept-charset">>;
+header_key(<<"Accept-Datetime">>) -> <<"accept-datetime">>;
+header_key('Accept-Encoding') -> <<"accept-encoding">>;
+header_key('Accept-Language') -> <<"accept-language">>;
+header_key(<<"Accept-", Rest/binary>>) -> header_key(Rest, <<"accept-">>);
+header_key('Authorization') -> <<"authorization">>;
+header_key('Cache-Control') -> <<"cache-control">>;
+header_key('Cookie') -> <<"cookie">>;
+header_key('Content-Length') -> <<"Content-Length">>;
+header_key('Content-Md5') -> <<"Content-Md5">>;
+header_key('Content-Type') -> <<"Content-Type">>;
+header_key(<<"Content-", Rest/binary>>) -> header_key(Rest, <<"content-">>);
+header_key('Date') -> <<"date">>;
+header_key(<<"Forwarded">>) -> <<"forwarded">>;
+header_key('From') -> <<"from">>;
+header_key('Host') -> <<"host">>;
+header_key('If-Modified-Since') -> <<"if-modified-since">>;
+header_key('If-Match') -> <<"if-match">>;
+header_key('If-None-Match') -> <<"if-none-match">>;
+header_key('If-Range') -> <<"if-range">>;
+header_key('If-Unmodified-Since') -> <<"if-unmodified-since">>;
+header_key('Max-Forwards') -> <<"max-forwards">>;
+header_key(<<"Origin">>) -> <<"origin">>;
+header_key('Pragma') -> <<"pragma">>;
+header_key('Proxy-Authorization') -> <<"proxy-authorization">>;
+header_key('Range') -> <<"range">>;
+header_key('Referer') -> <<"referer">>;
+header_key('TE') -> <<"te">>;
+header_key('User-Agent') -> <<"user-agent">>;
+header_key('Upgrade') -> <<"upgrade">>;
+header_key('Via') -> <<"via">>;
+header_key(<<"Warning">>) -> <<"warning">>;
+header_key(<<"X-Requested-With">>) -> <<"x-requested-with">>;
+header_key(<<"X-Forwarded-For">>) -> <<"x-forwarded-for">>;
+header_key(<<"X-Forwarded-Host">>) -> <<"x-forwarded-host">>;
+header_key(<<"X-Forwarded-Proto">>) -> <<"x-forwarded-proto">>;
+header_key(<<"Front-End-Https">>) -> <<"front-end-https">>;
+header_key(<<"X-Http-Method-Override">>) -> <<"x-http-method-override">>;
+header_key(<<"X-Wap-Profile">>) -> <<"x-wap-profile">>;
+header_key(<<"Proxy-Connection">>) -> <<"proxy-connection">>;
+header_key(<<"X-Csrf-Token">>) -> <<"x-csrf-token">>;
+header_key(<<"X-Csrftoken">>) -> <<"x-csrftoken">>;
+header_key(<<"X-Xsrf-Token">>) -> <<"x-xsrf-token">>;
+header_key(<<"Upgrade-Insecure-Requests">>) -> <<"upgrade-insecure-requests">>;
+header_key(Key) when is_atom(Key) ->
+    <<Upper, Rest/binary>> = atom_to_binary(Key, latin1),
+    header_key(Rest, <<(Upper-$A+$a)>>);
+header_key(<<Upper, Rest/binary>>) when Upper >= $A, Upper =< $Z ->
+    header_key(Rest, <<(Upper-$A+$a)>>);
+header_key(Key) when is_binary(Key) ->
+    header_key(Key, <<>>).
+
+header_key(<<$-, Upper, Rest/binary>>, Acc) when Upper >= $A, Upper =< $Z ->
+    header_key(Rest, <<Acc/binary, $-, (Upper-$A+$a)>>);
+header_key(<<Char, Rest/binary>>, Acc) ->
+    header_key(Rest, <<Acc/binary, Char>>);
+header_key(<<>>, Acc) ->
+    Acc.
+
+header_value(Value) ->
+    header_value(Value, byte_size(Value)).
+
+header_value(_, 0) ->
+    <<>>;
+header_value(Value, Len) ->
+    Pos = Len - 1,
+    case Value of
+        <<_:Pos/binary, $\s, _/binary>> ->
+            header_value(Value, Pos);
+        <<_:Pos/binary, $\t, _/binary>> ->
+            header_value(Value, Pos);
+        <<_:Len/binary>> ->
+            Value;
+        <<NValue:Len/binary, _/binary>> ->
+            NValue
     end.
 
 handle_headers(_, #body{transfer_encoding=chunked, content_length=Len}, Parser)
@@ -721,190 +737,34 @@ handle_headers(Headers, #body{content_length=Len},
   when Len =:= 0; Len == undefined ->
     {headers, Headers, done(Buffer, Parser)}.
 
-headers(<<"Accept: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"accept">>, Headers, Body, Parser);
-headers(<<"Accept-Charset: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"accept-charset">>, Headers, Body, Parser);
-headers(<<"Accept-Encoding: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"accept-encoding">>, Headers, Body, Parser);
-headers(<<"Accept-Datetime: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"accept-datetime">>, Headers, Body, Parser);
-headers(<<"Accept-Language: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"accept-language">>, Headers, Body, Parser);
-headers(<<"Accept-", Rest/binary>>, Headers, Body, Parser) ->
-    header_key(Rest, <<"accept-">>, Headers, Body, Parser);
-headers(<<"Authorization: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"authorization">>, Headers, Body, Parser);
-headers(<<"Cache-Control: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"cache-control">>, Headers, Body, Parser);
-headers(<<"Connection: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"connection">>, Headers, Body, Parser);
-headers(<<"Cookie: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"cookie">>, Headers, Body, Parser);
-headers(<<"Content-Length: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"content-length">>, Headers, Body, Parser);
-headers(<<"Content-MD5: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"content-md5">>, Headers, Body, Parser);
-headers(<<"Content-Type: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"content-type">>, Headers, Body, Parser);
-headers(<<"Content-", Rest/binary>>, Headers, Body, Parser) ->
-    header_key(Rest, <<"content-">>, Headers, Body, Parser);
-headers(<<"Date: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"date">>, Headers, Body, Parser);
-headers(<<"Expect: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"expect">>, Headers, Body, Parser);
-headers(<<"Forwarded: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"forwarded">>, Headers, Body, Parser);
-headers(<<"From: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"from">>, Headers, Body, Parser);
-headers(<<"Host: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"host">>, Headers, Body, Parser);
-headers(<<"If-Match: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"if-match">>, Headers, Body, Parser);
-headers(<<"If-Modified-Since: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"if-modified-since">>, Headers, Body, Parser);
-headers(<<"If-None-Match: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"if-none-match">>, Headers, Body, Parser);
-headers(<<"If-Range: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"if-range">>, Headers, Body, Parser);
-headers(<<"If-Unmodified-Since: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"if-unmodified-since">>, Headers, Body, Parser);
-headers(<<"Max-Forwards: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"max-forwards">>, Headers, Body, Parser);
-headers(<<"Origin: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"origin">>, Headers, Body, Parser);
-headers(<<"Pragma: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"pragma">>, Headers, Body, Parser);
-headers(<<"Proxy-Authorization: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"proxy-authorization">>, Headers, Body, Parser);
-headers(<<"Range: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"range">>, Headers, Body, Parser);
-headers(<<"Referer: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"referer">>, Headers, Body, Parser);
-headers(<<"TE: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"te">>, Headers, Body, Parser);
-headers(<<"User-Agent: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"user-Agent">>, Headers, Body, Parser);
-headers(<<"Upgrade: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"upgrade">>, Headers, Body, Parser);
-headers(<<"Via: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"via">>, Headers, Body, Parser);
-headers(<<"Warning: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"warning">>, Headers, Body, Parser);
-headers(<<"X-Requested-With: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-requested-with">>, Headers, Body, Parser);
-headers(<<"DNT: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"dnt">>, Headers, Body, Parser);
-headers(<<"X-Forwarded-For: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-forwarded-for">>, Headers, Body, Parser);
-headers(<<"X-Forwarded-Host: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-forwarded-host">>, Headers, Body, Parser);
-headers(<<"X-Forwarded-Proto: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-forwarded-proto">>, Headers, Body, Parser);
-headers(<<"Front-End-Https: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"front-end-https">>, Headers, Body, Parser);
-headers(<<"X-Http-Method-Override: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-http-method-override">>, Headers, Body, Parser);
-headers(<<"X-Wap-Profile: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-wap-profile">>, Headers, Body, Parser);
-headers(<<"Proxy-Connection: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"proxy-connection">>, Headers, Body, Parser);
-headers(<<"X-CSRF-Token: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-csrf-token">>, Headers, Body, Parser);
-headers(<<"X-CSRFToken: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-csrftoken">>, Headers, Body, Parser);
-headers(<<"X-XSRF-TOKEN: ", Rest/binary>>, Headers, Body, Parser) ->
-    header_value(Rest, <<"x-xsrf-token">>, Headers, Body, Parser);
-headers(<<"Upgrade-Insecure-Requests: ", Rest/binary>>, Headers, Body,
-        Parser) ->
-    header_value(Rest, <<"upgrade-insecure-requests">>, Headers, Body, Parser);
-headers(<<>>, Headers, Body, Parser) ->
-    {ok, lists:reverse(Headers), Body, Parser};
-headers(<<RawHeaders/binary>>, Headers, Body, Parser) ->
-    header_key(RawHeaders, <<>>, Headers, Body, Parser).
-
-header_key(<<Char, Rest/binary>>, Acc, Headers, Body, Parser)
-  when Char >= $A, Char =< $Z ->
-    header_key(Rest, <<Acc/binary, (Char-$A+$a)>>, Headers, Body, Parser);
-header_key(<<$:, $\s, Rest/binary>>, Key, Headers, Body, Parser)
-  when Key =/= <<>> ->
-    header_value(Rest, Key, Headers, Body, Parser);
-header_key(<<$:, $\t, Rest/binary>>, Key, Headers, Body, Parser)
-  when Key =/= <<>> ->
-    header_value(Rest, Key, Headers, Body, Parser);
-header_key(<<$:, Rest/binary>>, Key, _, _, _) ->
-    [RemLine | _] = binary:split(Rest, <<"\r\n">>),
-    {error, {invalid_header_line, <<Key/binary, $:, RemLine/binary>>}};
-header_key(<<"\r\n", _>>, Key, _, _, _) ->
-    {error, {invalid_header_line, Key}};
-header_key(<<Char, Rest/binary>>, Key, Headers, Body, Parser) ->
-    header_key(Rest, <<Key/binary, Char>>, Headers, Body, Parser);
-header_key(<<>>, Key, _, _, _) ->
-    {error, {invalid_header_line, Key}}.
-
-header_value(RawHeaders, Key, Headers, Body, Parser) ->
-    header_lows(RawHeaders, <<>>, Key, Headers, Body, Parser).
-
-header_lows(<<$\s, Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_lows(Rest, Value, Key, Headers, Body, Parser);
-header_lows(<<$\t, Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_lows(Rest, Value, Key, Headers, Body, Parser);
-header_lows(<<Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_value(Rest, Value, Key, Headers, Body, Parser).
-
-header_value(<<"\r\n\s", Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_value(Rest, <<Value/binary, $\s>>, Key, Headers, Body, Parser);
-header_value(<<"\r\n\t", Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_value(Rest, <<Value/binary, $\s>>, Key, Headers, Body, Parser);
-header_value(<<"\r\n", Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    parse_header(Key, header_rows(Value), Rest, Headers, Body, Parser);
-header_value(<<Char, Rest/binary>>, Value, Key, Headers, Body, Parser) ->
-    header_value(Rest, <<Value/binary, Char>>, Key, Headers, Body, Parser);
-header_value(<<>>, Value, Key, Headers, Body, Parser) ->
-    parse_header(Key, header_rows(Value), <<>>, Headers, Body, Parser).
-
-header_rows(Value) ->
-    header_rows(Value, byte_size(Value)).
-
-header_rows(Value, Len) ->
-    Pos = Len - 1,
-    case Value of
-        <<_:Pos/binary, $\s, _/binary>> ->
-            header_rows(Value, Pos);
-        <<_:Pos/binary, $\t, _/binary>> ->
-            header_rows(Value, Pos);
-        <<NValue:Len/binary, _/binary>> ->
-            NValue
-    end.
-
-parse_header(<<"connection">> = Key, Value, Rest, Headers, Body,
-             #parser{connection={force_close, Connection},
-                     version=Version} = Parser) ->
-    NHeaders = [{Key, Value} | Headers],
+connection(Value, Rest, Headers, Body,
+           #parser{connection={force_close, Connection},
+                   version=Version} = Parser) ->
+    NHeaders = [{<<"connection">>, Value} | Headers],
     case connection(Value, Version) of
         Connection ->
             headers(Rest, NHeaders, Body, Parser);
         _ when Connection =/= undefined ->
-            {error, {duplicate_header, Key}};
+            {error, {duplicate_header, <<"connection">>}};
         NConnection ->
             NParser = Parser#parser{connection={force_close, NConnection}},
             headers(Rest, NHeaders, Body, NParser)
     end;
-parse_header(<<"connection">> = Key, Value, Rest, Headers, Body,
-             #parser{connection=Connection, version=Version} = Parser) ->
-    NHeaders = [{Key, Value} | Headers],
+connection(Value, Rest, Headers, Body,
+           #parser{connection=Connection, version=Version} = Parser) ->
+    NHeaders = [{<<"connection">>, Value} | Headers],
     case connection(Value, Version) of
         Connection ->
             headers(Rest, NHeaders, Body, Parser);
         _ when Connection =/= undefined ->
-            {error, {duplicate_header, Key}};
+            {error, {duplicate_header, <<"connection">>}};
         NConnection ->
             headers(Rest, NHeaders, Body, Parser#parser{connection=NConnection})
-    end;
-parse_header(<<"content-length">> = Key, Value, Rest, Headers,
-             #body{content_length=Len} = Body,
-             #parser{config=#config{max_body=MaxBody}} = Parser) ->
-    NHeaders = [{Key, Value} | Headers],
+    end.
+
+content_length(Value, Rest, Headers, #body{content_length=Len} = Body,
+               #parser{config=#config{max_body=MaxBody}} = Parser) ->
+    NHeaders = [{<<"content-length">>, Value} | Headers],
     case content_length(Value) of
         NLen when is_integer(NLen), NLen > MaxBody, Len == undefined ->
             {error, {body_too_long, Value}};
@@ -913,27 +773,32 @@ parse_header(<<"content-length">> = Key, Value, Rest, Headers,
         Len ->
             headers(Rest, NHeaders, Body, Parser);
         _ when is_integer(Len) ->
-            {error, {duplicate_header, Key}};
+            {error, {duplicate_header, <<"content-length">>}};
         {invalid, Value} ->
             {error, {invalid_content_length, Value}}
-    end;
-parse_header(<<"expect">> = Key, Value, Rest, Headers,
-             #body{expect=Expect} = Body, #parser{version='1.1'} = Parser) ->
+    end.
+
+expect(Value, Rest, Headers, #body{expect=Expect} = Body,
+       #parser{version='1.1'} = Parser) ->
     case expect(Value) of
         continue ->
-            NHeaders = [{Key, Value} | Headers],
+            NHeaders = [{<<"expect">>, Value} | Headers],
             headers(Rest, NHeaders, Body#body{expect=continue}, Parser);
         _ when Expect == continue ->
-            {error, {duplicate_header, Key}};
+            {error, {duplicate_header, <<"expect">>}};
         {unknown, Value} ->
             {error, {unknown_expectation, Value}}
     end;
-parse_header(<<"transfer-encoding">> = Key, Value, Rest, Headers,
-             #body{transfer_encoding=Transfer} = Body,
-             #parser{version=Version} = Parser) ->
+expect(Value, Rest, Headers, Body, #parser{version='1.0'} = Parser) ->
+    headers(Rest, [{<<"expect">>, Value} | Headers], Body, Parser).
+
+
+transfer_encoding(Value, Rest, Headers,
+                  #body{transfer_encoding=Transfer} = Body,
+                  #parser{version=Version} = Parser) ->
     case transfer_encoding(Value, Version) of
         chunked when Transfer == undefined ->
-            NHeaders = [{Key, Value} | Headers],
+            NHeaders = [{<<"transfer-encoding">>, Value} | Headers],
             NBody = Body#body{transfer_encoding=chunked},
             headers(Rest, NHeaders, NBody, Parser);
         chunked when Transfer == chunked ->
@@ -942,9 +807,7 @@ parse_header(<<"transfer-encoding">> = Key, Value, Rest, Headers,
             {error, {unsupported_encoding, <<"chunked, ", Encoding/binary>>}};
         {unsupported, Encoding} ->
             {error, {unsupported_encoding, Encoding}}
-    end;
-parse_header(Key, Value, Rest, Headers, Body, Parser) ->
-    headers(Rest, [{Key, Value} | Headers], Body, Parser).
+    end.
 
 connection(<<C, L, O, S, E>>, _)
   when (C =:= $c orelse C =:= $C),
@@ -1138,12 +1001,7 @@ fail(Parser) ->
     Parser#parser{req=failed, buffer=done}.
 
 resp_content_length(Body) ->
-    case iolist_size(Body) of
-        0 ->
-            [];
-        Len ->
-            [<<"Content-Length: ">>, integer_to_binary(Len), $\r, $\n]
-    end.
+    [<<"Content-Length: ">>, integer_to_binary(iolist_size(Body)), $\r, $\n].
 
 next(#parser{req=Req, connection=shutdown} = Parser) when Req =/= done ->
     {shutdown, Parser#parser{connection={force_close, shutdown}}};
@@ -1180,11 +1038,15 @@ resp_connection({keep_alive, _}) ->
 resp_connection(Close) when Close == close; Close == shutdown ->
     <<"Connection: close\r\n">>.
 
-response(Status, Headers) ->
-    [<<"HTTP/1.1 ">>, status(Status), $\r, $\n | resp_headers(Headers)].
+response(Status, Headers, Parser) ->
+    ReqLine = [<<"HTTP/1.1 ">>, status(Status), $\r, $\n],
+    resp_headers(Headers, ReqLine, Parser).
 
-resp_headers(Headers) ->
-    resp_headers(Headers, []).
+resp_headers(Headers, Acc, #parser{config=#config{date=exclude}}) ->
+    resp_headers(Headers, Acc);
+resp_headers(Headers, Acc, #parser{config=#config{date=Date}}) ->
+    NAcc = [Acc, <<"Date:" >>, hippo_date:rfc5322_date(Date), $\r, $\n],
+    resp_headers(Headers, NAcc).
 
 resp_headers([{Key, Value} | Headers], Acc) ->
     NKey = camel_header(Key),

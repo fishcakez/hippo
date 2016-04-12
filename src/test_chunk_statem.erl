@@ -23,8 +23,7 @@ recv(_, {hippo_recv_chunk, _Chunk},  _) ->
     {keep_state_and_data,
      {next_event, internal, {hippo_recv, ?TIMEOUT}}};
 recv(_, hippo_recv_done, StateData) ->
-    Headers = [{<<"date">>, <<"Tue, 29 Mar 2016 23:29:38 GMT">>},
-               {<<"server">>, <<"Hippo">>}],
+    Headers = [{<<"server">>, <<"Hippo">>}],
     {next_state, send, StateData,
      {next_event, internal, {hippo_send_response, 200, Headers, chunk}}}.
 

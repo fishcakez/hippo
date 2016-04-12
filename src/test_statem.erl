@@ -8,8 +8,7 @@
 -export([terminate/3]).
 
 init(Path) ->
-    Headers = [{<<"date">>, elli_date()},
-               {<<"server">>, <<"Hippo">>},
+    Headers = [{<<"server">>, <<"Hippo">>},
                {<<"content-type">>, <<"text/plain">>}],
     Body = <<"Hello World!">>,
     {state_functions, send, Path,
@@ -23,11 +22,3 @@ code_change(_, State, StateData, _) ->
 
 terminate(_, _, _) ->
     ok.
-
-elli_date() ->
-    case ets:lookup(elli_date, rfc1123) of
-        [{rfc1123, Date}] ->
-            Date;
-        [] ->
-            <<"">>
-    end.

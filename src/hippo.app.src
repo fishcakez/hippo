@@ -5,11 +5,11 @@
   {applications,
    [kernel,
     stdlib,
-    elli_date
+    inets
    ]},
   {env,[]},
   {modules, []},
-
+  {mod, {hippo_app, []}},
   {maintainers, []},
   {licenses, []},
   {links, []}
