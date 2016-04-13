@@ -16,7 +16,7 @@
                sock_ref :: non_neg_integer(),
                spec :: hd_statem_router:spec()}).
 
--record(hippo, {headers = done :: [{binary(), binary()}] | done,
+-record(hippo, {recv = sync :: {headers, [{binary(), binary()}]} | sync | async,
                 mode = handle_event_function :: gen_statem2:callback_mode(),
                 sock :: port(),
                 parser :: hippo_http:parse() | done,
@@ -80,16 +80,16 @@ handle_event(info, {tcp_closed, Sock}, await, #hippo{sock=Sock}) ->
     {stop, {shutdown, {inet, closed}}};
 handle_event(info, {tcp_error, Sock, Reason}, await, #hippo{sock=Sock}) ->
     {stop, {shutdown, {inet, Reason}}};
-handle_event(internal, {request, _Request, Headers}, await,
-             #hippo{spec=_Spec} = HippoData) ->
-    %case hippo_router:run(Request, Spec) of
-        %{init, _Mod, _Args} = Init ->
-            {keep_state, HippoData#hippo{headers=Headers},
-             {next_event, internal, {init, test_statem, []}}};
-        %{error, Reason} ->
-         %   {keep_state_and_data,
-          %   {next_event, internal, {error, {hippo_router, Reason}}}}
-    %end;
+handle_event(internal, {request, Request, Headers}, await,
+             #hippo{spec=Spec} = HippoData) ->
+    case hippo_router:run(Request, Spec) of
+        {init, _Mod, _Args} = Init ->
+            {keep_state, HippoData#hippo{recv={headers, Headers}},
+             {next_event, internal, Init}};
+        {error, Reason} ->
+            {keep_state_and_data,
+             {next_event, internal, {error, {hippo_router, Reason}}}}
+    end;
 handle_event(internal, {init, Mod, Args}, await, HippoData) ->
     try Mod:init(Args) of
         Result ->
@@ -98,9 +98,13 @@ handle_event(internal, {init, Mod, Args}, await, HippoData) ->
         throw:Result ->
             init(Result, Mod, HippoData)
     end;
+handle_event(internal, {hippo_recv, _}, _,
+             {StateData, #hippo{recv={headers, Headers}} = HippoData}) ->
+    NHippoData = HippoData#hippo{recv=sync},
+    keep_insert(NHippoData, StateData, {hippo_recv_headers, Headers});
 handle_event(internal, {hippo_recv, Timeout}, _,
              {StateData,
-              #hippo{headers=done, parser=Parser, sock=Sock} = HippoData}) ->
+              #hippo{recv=sync, parser=Parser, sock=Sock} = HippoData}) ->
     case parse(Parser, Sock, Timeout) of
         {chunk, Chunk, NParser} ->
             NHippoData = HippoData#hippo{parser=NParser},
@@ -112,14 +116,33 @@ handle_event(internal, {hippo_recv, Timeout}, _,
         {done, NParser} ->
             NHippoData = HippoData#hippo{parser=NParser},
             keep_insert(NHippoData, StateData, hippo_recv_done);
+        {more, _, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=async},
+            {keep_state, {StateData, NHippoData}};
         {error, Reason, NParser} ->
             NHippoData = recv_error(NParser, HippoData),
             keep_insert(NHippoData, StateData, {hippo_recv_error, Reason})
     end;
-handle_event(internal, {hippo_recv, _}, _,
-             {StateData, #hippo{headers=Headers} = HippoData}) ->
-    NHippoData = HippoData#hippo{headers=done},
-    keep_insert(NHippoData, StateData, {hippo_recv_headers, Headers});
+handle_event(internal, {hippo_recv, async}, _, {_, #hippo{recv=async}}) ->
+    keep_state_and_data;
+handle_event(internal, {hippo_recv, Timeout}, _,
+             {StateData,
+              #hippo{recv=async, parser=Parser, sock=Sock} = HippoData}) ->
+    case async_parse(Parser, Sock, Timeout) of
+        {chunk, Chunk, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            keep_insert(NHippoData, StateData, {hippo_recv_chunk, Chunk});
+        {trailers, Trailers, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            Event = {hippo_recv_trailers, Trailers},
+            keep_insert(NHippoData, StateData, Event);
+        {done, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            keep_insert(NHippoData, StateData, hippo_recv_done);
+        {error, Reason, NParser} ->
+            NHippoData = recv_error(NParser, HippoData#hippo{recv=sync}),
+            keep_insert(NHippoData, StateData, {hippo_recv_error, Reason})
+    end;
 handle_event(internal, {hippo_send_response, Status, Headers, Body}, _,
              {StateData, HippoData}) ->
     case send_response(Status, Headers, Body, HippoData) of
@@ -148,7 +171,7 @@ handle_event(internal, {hippo_send_chunk, Chunk}, _,
             keep_insert(NHippoData, StateData, {hippo_send_error, Reason})
    end;
 handle_event(internal, {hippo_send_last_chunk, Chunk}, _,
-             {#hippo{sock=Sock, parser=Parser} = HippoData, StateData}) ->
+             {StateData, #hippo{sock=Sock, parser=Parser} = HippoData}) ->
     case send_last_chunk(Sock, Chunk, Parser) of
         {sent_last_chunk, NParser} ->
             NHippoData = HippoData#hippo{parser=NParser},
@@ -159,6 +182,34 @@ handle_event(internal, {hippo_send_last_chunk, Chunk}, _,
             NHippoData = send_error(HippoData),
             keep_insert(NHippoData, StateData, {hippo_send_error, Reason})
     end;
+handle_event(info, {tcp, Sock, Data}, {_, _},
+             {StateData,
+              #hippo{recv=async, sock=Sock, parser=Parser} = HippoData}) ->
+    case recv_parse({ok, Data}, Parser) of
+        {chunk, Chunk, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            keep_insert(NHippoData, StateData, {hippo_recv_chunk, Chunk});
+        {trailers, Trailers, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            Event = {hippo_recv_trailers, Trailers},
+            keep_insert(NHippoData, StateData, Event);
+        {done, NParser} ->
+            NHippoData = HippoData#hippo{parser=NParser, recv=sync},
+            keep_insert(NHippoData, StateData, hippo_recv_done);
+        {error, Reason, NParser} ->
+            NHippoData = recv_error(NParser, HippoData#hippo{recv=sync}),
+            keep_insert(NHippoData, StateData, {hippo_recv_error, Reason})
+    end;
+handle_event(info, {tcp_closed, Sock}, {_, _},
+             {StateData, #hippo{recv=async, sock=Sock} = HippoData}) ->
+    NHippoData = HippoData#hippo{recv=sync},
+    keep_insert(NHippoData, StateData, {hippo_recv_error, {inet, closed}});
+handle_event(info, {tcp_error, Sock, Reason}, {_, _},
+             {StateData, #hippo{recv=async, sock=Sock} = HippoData}) ->
+    NHippoData = HippoData#hippo{recv=sync},
+    keep_insert(NHippoData, StateData, {hippo_recv_error, {inet, Reason}});
+handle_event(info, {tcp_error, Sock, Reason}, await, #hippo{sock=Sock}) ->
+    {stop, {shutdown, {inet, Reason}}};
 handle_event(Type, Event, {Mod, State},
              {StateData, #hippo{mode=state_functions} = HippoData}) ->
     try Mod:State(Type, Event, StateData) of
@@ -186,7 +237,7 @@ handle_event(internal, {terminate, Reason}, {terminate, Mod, State},
         throw:_ ->
             flush(HippoData)
    end;
-handle_event(cast, flushed, flush, #hippo{sock=Sock} = HippoData) ->
+handle_event(cast, flushed, flush, #hippo{recv=sync, sock=Sock} = HippoData) ->
     case inet:setopts(Sock, [{active, once}]) of
         ok ->
             {next_state, await, HippoData};
@@ -282,7 +333,7 @@ until() ->
     erlang:monotonic_time(milli_seconds) + ?REQUEST_TIMEOUT.
 
 timeout(Until) ->
-    max(Until - erlang:monotonitc_time(milli_seconds), 0).
+    max(Until - erlang:monotonic_time(milli_seconds), 0).
 
 init({Mode, State, StateData}, Mod, HippoData)
   when Mode == state_functions, is_atom(State); Mode == handle_event_function ->
@@ -365,6 +416,8 @@ parse(Parser, Sock, Timeout) ->
     case hippo_http:parse(Parser) of
         {more, _, NParser} when Timeout =/= async ->
             recv_parse(gen_tcp:recv(Sock, 0, Timeout), NParser);
+        {more, _, _} = Result when Timeout =:= async ->
+            async_recv(inet:setopts(Sock, [{active, once}]), Result);
         {error, Reason, NParser} ->
             {error, {hippo_http, Reason}, NParser};
         Result ->
@@ -382,6 +435,45 @@ recv_parse({ok, Buffer}, Parser) ->
     end;
 recv_parse({error, Reason}, Parser) ->
     {error, {inet, Reason}, Parser}.
+
+async_recv(ok, Result) ->
+    Result;
+async_recv({error, Reason}, {_, _, Parser}) ->
+    {error, {inet, Reason}, Parser}.
+
+async_parse(Parser, Sock, Timeout) ->
+    receive
+        {tcp, Sock, Data} ->
+            recv_parse({ok, Data}, Parser);
+        {tcp_error, Sock, Reason} ->
+            recv_parse({error, Reason}, Parser);
+        {tcp_closed, Sock} ->
+            recv_parse({error, closed}, Parser)
+    after
+        Timeout ->
+            timeout_parse(Parser, Sock)
+    end.
+
+timeout_parse(Parser, Sock) ->
+    case inet:setopts(Sock, [{active, false}]) of
+        ok ->
+            flush_parse(Parser, Sock, {error, timeout});
+        {error, _} = Error ->
+            flush_parse(Parser, Sock, Error)
+    end.
+
+flush_parse(Parser, Sock, Error) ->
+    receive
+        {tcp, Sock, Data} ->
+            recv_parse({ok, Data}, Parser);
+        {tcp_error, Sock, Reason} ->
+            recv_parse({error, Reason}, Parser);
+        {tcp_closed, Sock} ->
+            recv_parse({error, closed}, Parser)
+    after
+        0 ->
+            recv_parse(Error, Parser)
+    end.
 
 recv_error(Parser, HippoData) ->
     HippoData#hippo{parser=Parser}.

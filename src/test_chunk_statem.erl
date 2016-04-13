@@ -17,11 +17,11 @@ init(Path) ->
 
 headers(_, {hippo_recv_headers,  _Headers}, StateData) ->
     {next_state, recv, StateData,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}}.
+     {next_event, internal, {hippo_recv, async}}}.
 
 recv(_, {hippo_recv_chunk, _Chunk},  _) ->
     {keep_state_and_data,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}};
+     {next_event, internal, {hippo_recv, async}}};
 recv(_, hippo_recv_done, StateData) ->
     Headers = [{<<"server">>, <<"Hippo">>}],
     {next_state, send, StateData,

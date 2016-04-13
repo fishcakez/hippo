@@ -179,7 +179,7 @@ parse(Data, #parser{buffer= <<>>, req={body, Len}} = Parser) ->
             Rem = Len - Size,
             {chunk, Data, Parser#parser{buffer= <<>>, req={body, Rem}}};
         _ ->
-            <<Body:Len, Rest/binary>> = iolist_to_binary(Data),
+            <<Body:Len/binary, Rest/binary>> = iolist_to_binary(Data),
             {chunk, Body, done(Rest, Parser)}
     end;
 parse(Data, #parser{buffer=Buffer, req={body, Len}} = Parser)
