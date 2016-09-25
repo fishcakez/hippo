@@ -1,7 +1,7 @@
 -module(hippo_statem).
 
 -behaviour(acceptor).
--behaviour(gen_statem2).
+-behaviour(gen_statem).
 
 %% acceptor api
 
@@ -11,6 +11,8 @@
 
 %% gen_statem api
 
+-export([init/1]).
+-export([callback_mode/0]).
 -export([handle_event/4]).
 -export([format_status/2]).
 -export([code_change/4]).
@@ -19,7 +21,7 @@
 -define(REQUEST_TIMEOUT, 5000).
 
 -record(hippo, {recv = sync :: {headers, [{binary(), binary()}]} | sync | async,
-                mode = handle_event_function :: gen_statem2:callback_mode(),
+                mode = handle_event_function :: gen_statem:callback_mode(),
                 sock :: port(),
                 ref :: reference(),
                 parser :: hippo_http:parse() | done,
@@ -38,13 +40,18 @@ acceptor_continue(PeerName, Sock, AcceptState) ->
     #{sockname := SockName, ref := Ref, spec := Spec} = AcceptState,
     Parser = hippo_http:new(SockName, PeerName),
     HippoData = #hippo{sock=Sock, ref=Ref, spec=Spec, parser=Parser},
-    gen_statem2:enter_loop(?MODULE, [], handle_event_function, await, HippoData,
-                           []).
+    gen_statem:enter_loop(?MODULE, [], await, HippoData, []).
 
 acceptor_terminate(_, _) ->
     ok.
 
 %% gen_statem api
+
+init(_) ->
+    {stop, enotsup}.
+
+callback_mode() ->
+    handle_event_function.
 
 handle_event(info, {tcp, Sock, Data}, await,
              #hippo{sock=Sock, parser=Parser} = HippoData) ->
@@ -315,12 +322,10 @@ until() ->
 timeout(Until) ->
     max(Until - erlang:monotonic_time(milli_seconds), 0).
 
-init({Mode, State, StateData}, Mod, HippoData)
-  when Mode == state_functions, is_atom(State); Mode == handle_event_function ->
-    enter_loop(Mode, State, StateData, [], Mod, HippoData);
-init({Mode, State, StateData, Actions}, Mod, HippoData)
-  when Mode == state_functions, is_atom(State); Mode == handle_event_function ->
-    enter_loop(Mode, State, StateData, Actions, Mod, HippoData);
+init({ok, State, StateData}, Mod, HippoData) ->
+    enter_loop(State, StateData, [], Mod, HippoData);
+init({ok, State, StateData, Actions}, Mod, HippoData) ->
+    enter_loop(State, StateData, Actions, Mod, HippoData);
 init(ignore, Mod, _) ->
     {keep_state_and_data, {next_event, internal, {error, {Mod, normal}}}};
 init({stop, Reason}, Mod, _) ->
@@ -329,9 +334,18 @@ init(Other, Mod, _) ->
     {keep_state_and_data,
      {next_event, internal, {error, {Mod, {bad_return_value, Other}}}}}.
 
-enter_loop(Mode, State, StateData, Actions, Mod, HippoState) ->
-    NHippoState = HippoState#hippo{mode=Mode},
+enter_loop(State, StateData, Actions, Mod, HippoState) ->
+    NHippoState = HippoState#hippo{mode=callback_mode(Mod)},
     {next_state, {Mod, State}, {StateData, NHippoState}, Actions}.
+
+callback_mode(Mod) ->
+    try Mod:callback_mode() of
+        Mode ->
+            Mode
+    catch
+        throw:Mode ->
+            Mode
+    end.
 
 keep_insert(HippoData, StateData, Event) ->
     {keep_state, {StateData, HippoData}, {next_event, internal, Event}}.
@@ -383,7 +397,7 @@ reply_then_stop(Replies, Mod, State, StateData, HippoData) ->
 
 flush(#hippo{conn={keep_alive, Parser}} = HippoData) ->
     %% TODO: include reference
-    gen_statem2:cast(self(), flushed),
+    gen_statem:cast(self(), flushed),
     NHippoData = HippoData#hippo{conn=close, parser=Parser},
     {next_state, flush, NHippoData};
 flush(#hippo{conn=close}) ->

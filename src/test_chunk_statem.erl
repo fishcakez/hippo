@@ -1,10 +1,11 @@
 -module(test_chunk_statem).
 
--behaviour(gen_statem2).
+-behaviour(gen_statem).
 
 -define(TIMEOUT, 5000).
 
 -export([init/1]).
+-export([callback_mode/0]).
 -export([headers/3]).
 -export([recv/3]).
 -export([send/3]).
@@ -12,8 +13,11 @@
 -export([terminate/3]).
 
 init(Path) ->
-    {state_functions, headers, Path,
+    {ok, headers, Path,
      {next_event, internal, {hippo_recv, ?TIMEOUT}}}.
+
+callback_mode() ->
+    state_functions.
 
 headers(_, {hippo_recv_headers,  _Headers}, StateData) ->
     {next_state, recv, StateData,
