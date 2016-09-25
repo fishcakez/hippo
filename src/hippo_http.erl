@@ -39,9 +39,8 @@
                   headers_too_long | chunked_with_content_length |
                   invalid_header_line | duplicate_header | body_too_long |
                   invalid_content_length | invalid_header_line |
-                  invalid_content_length | unknown_expectation|
-                  unsupported_encoding | chunk_line_too_long |
-                  invalid_chunk_line | trailers_too_long |
+                  unknown_expectation| unsupported_encoding |
+                  chunk_line_too_long | invalid_chunk_line | trailers_too_long |
                   invalid_trailer_line | duplicate_trailer | done, iodata()} |
                  await_response | chunk | stream | done.
 
@@ -387,8 +386,10 @@ request(Data, Empty, #parser{config=Config} = Parser) ->
          Rest} ->
             parse_request(Method, Path, abs_uri(Abs), Vsn, Rest, Parser);
         {ok, {http_request, 'OPTIONS', '*', {1, _} = Vsn}, Rest} ->
+            #config{sockname=SockName, peername=PeerName} = Config,
             Request = #hippo_request{method=options, path='*', query=[],
-                                     uri= <<"*">>, version=version(Vsn)},
+                                     uri= <<"*">>, version=version(Vsn),
+                                     sockname=SockName, peername=PeerName},
             {request, Request, Parser#parser{req=await_headers, buffer=Rest}};
         {ok, {http_request, _, '*', _}, _} ->
             req_error(invalid_uri, <<$*>>, Parser);
@@ -401,7 +402,7 @@ request(Data, Empty, #parser{config=Config} = Parser) ->
         {ok, {http_error, <<"\r\n">>}, Rest} when Empty < MaxEmpty ->
             request(Rest, Empty+2, Parser);
         {ok, {http_error, <<"\r\n">>}, _} when Empty >= MaxEmpty ->
-            request(empty_line_too_long, <<"\r\n">>, Parser);
+            req_error(empty_line_too_long, <<"\r\n">>, Parser);
         {ok, {http_error, ReqLine}, _} ->
             req_error(bad_request_line, ReqLine, Parser);
         {ok, {http_response, _, _, _}, Rest} ->
@@ -631,7 +632,7 @@ headers(Buffer, Headers, Body, Parser) ->
         {ok, http_eoh, <<>>} ->
             handle_headers(lists:reverse(Headers), Body, Parser);
         {ok, {http_error, Line}, _} ->
-            {error, {bad_header_line, Line}, fail(Parser)}
+            {error, {invalid_header_line, Line}, fail(Parser)}
     end.
 
 header_key('Accept') -> <<"accept">>;
@@ -745,7 +746,7 @@ connection(Value, Rest, Headers, Body,
         Connection ->
             headers(Rest, NHeaders, Body, Parser);
         _ when Connection =/= undefined ->
-            {error, {duplicate_header, <<"connection">>}};
+            {error, {duplicate_header, <<"connection">>}, fail(Parser)};
         NConnection ->
             NParser = Parser#parser{connection={force_close, NConnection}},
             headers(Rest, NHeaders, Body, NParser)
@@ -757,7 +758,7 @@ connection(Value, Rest, Headers, Body,
         Connection ->
             headers(Rest, NHeaders, Body, Parser);
         _ when Connection =/= undefined ->
-            {error, {duplicate_header, <<"connection">>}};
+            {error, {duplicate_header, <<"connection">>}, fail(Parser)};
         NConnection ->
             headers(Rest, NHeaders, Body, Parser#parser{connection=NConnection})
     end.
@@ -767,15 +768,15 @@ content_length(Value, Rest, Headers, #body{content_length=Len} = Body,
     NHeaders = [{<<"content-length">>, Value} | Headers],
     case content_length(Value) of
         NLen when is_integer(NLen), NLen > MaxBody, Len == undefined ->
-            {error, {body_too_long, Value}};
+            {error, {body_too_long, Value}, fail(Parser)};
         NLen when is_integer(NLen), NLen > 0, Len == undefined ->
             headers(Rest, NHeaders, Body#body{content_length=NLen}, Parser);
         Len ->
             headers(Rest, NHeaders, Body, Parser);
         _ when is_integer(Len) ->
-            {error, {duplicate_header, <<"content-length">>}};
+            {error, {duplicate_header, <<"content-length">>}, fail(Parser)};
         {invalid, Value} ->
-            {error, {invalid_content_length, Value}}
+            {error, {invalid_content_length, Value}, fail(Parser)}
     end.
 
 expect(Value, Rest, Headers, #body{expect=Expect} = Body,
@@ -785,9 +786,9 @@ expect(Value, Rest, Headers, #body{expect=Expect} = Body,
             NHeaders = [{<<"expect">>, Value} | Headers],
             headers(Rest, NHeaders, Body#body{expect=continue}, Parser);
         _ when Expect == continue ->
-            {error, {duplicate_header, <<"expect">>}};
+            {error, {duplicate_header, <<"expect">>}, fail(Parser)};
         {unknown, Value} ->
-            {error, {unknown_expectation, Value}}
+            {error, {unknown_expectation, Value}, fail(Parser)}
     end;
 expect(Value, Rest, Headers, Body, #parser{version='1.0'} = Parser) ->
     headers(Rest, [{<<"expect">>, Value} | Headers], Body, Parser).
@@ -802,11 +803,13 @@ transfer_encoding(Value, Rest, Headers,
             NBody = Body#body{transfer_encoding=chunked},
             headers(Rest, NHeaders, NBody, Parser);
         chunked when Transfer == chunked ->
-            {error, {unsupported_encoding, <<"chunked, chunked">>}};
+            NParser = fail(Parser),
+            {error, {unsupported_encoding, <<"chunked, chunked">>}, NParser};
         {unsupported, Encoding} when Transfer == chunked ->
-            {error, {unsupported_encoding, <<"chunked, ", Encoding/binary>>}};
+            NEncoding = <<"chunked, ", Encoding/binary>>,
+            {error, {unsupported_encoding, NEncoding}, fail(Parser)};
         {unsupported, Encoding} ->
-            {error, {unsupported_encoding, Encoding}}
+            {error, {unsupported_encoding, Encoding}, fail(Parser)}
     end.
 
 connection(<<C, L, O, S, E>>, _)
@@ -978,16 +981,16 @@ parse_trailers(Data, Start, #parser{config=Config} = Parser) ->
 parse_trailers(RawTrailers, #parser{config=Config} = Parser) ->
     #config{trailers=IncTrailers} = Config,
     case headers(RawTrailers, [], done, Parser) of
-        {ok, [_|_] = Trailers, done, NParser} when IncTrailers == include ->
+        {headers, [_|_] = Trailers, NParser} when IncTrailers == include ->
             {trailers, Trailers, NParser};
-        {ok, _, done, NParser} ->
+        {headers, _, NParser} ->
             {done, NParser};
-        {error, {invalid_header_line, Line}} ->
-            {error, {invalid_trailer_line, Line}, fail(Parser)};
-        {error, {duplicate_header, Key}} ->
-            {error, {duplicate_trailer, Key}, fail(Parser)};
-        {error, Reason} ->
-            {error, Reason, fail(Parser)}
+        {error, {invalid_header_line, Line}, NParser} ->
+            {error, {invalid_trailer_line, Line}, NParser};
+        {error, {duplicate_header, Key}, NParser} ->
+            {error, {duplicate_trailer, Key}, NParser};
+        {error, Reason, NParser} ->
+            {error, Reason, NParser}
     end.
 
 done(<<>>, #parser{resp=await_response} = Parser) ->

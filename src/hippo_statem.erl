@@ -24,10 +24,10 @@
                 mode = handle_event_function :: gen_statem:callback_mode(),
                 sock :: port(),
                 ref :: reference(),
-                parser :: hippo_http:parse() | done,
+                parser :: hippo_http:parser() | done,
                 conn = close :: close | shutdown | {keep_alive,
-                                                    hippo_http:parse()},
-                spec :: hd_statem_router:spec()}).
+                                                    hippo_http:parser()},
+                spec :: hippo_router:spec()}).
 
 
 %% acceptor api
@@ -483,8 +483,6 @@ send_response(Status, Headers, Body,
 
 send_chunk(Sock, Chunk, Parser) ->
     case hippo_http:chunk(Chunk, Parser) of
-        {more, _, NParser} ->
-            {sent_chunk, NParser};
         {chunk, Data, NParser} ->
             send(Sock, Data, sent_chunk, NParser);
         {error, Reason, NParser} ->
