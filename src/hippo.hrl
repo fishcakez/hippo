@@ -3,6 +3,5 @@
                         query :: [{binary(), binary()}],
                         version :: hippo_http:version(),
                         uri :: binary(),
-                        sockname :: {inet:ip_address(), inet:port_num()},
-                        peername :: {inet:ip_address(), inet:port_num()}}).
- 
+                        sockname :: acceptor_pool:name(),
+                        peername :: acceptor_pool:name()}).

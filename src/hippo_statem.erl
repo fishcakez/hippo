@@ -1,9 +1,16 @@
 -module(hippo_statem).
 
+-behaviour(acceptor).
 -behaviour(gen_statem2).
 
--export([spawn_monitor/2]).
--export([init_it/3]).
+%% acceptor api
+
+-export([acceptor_init/3]).
+-export([acceptor_continue/3]).
+-export([acceptor_terminate/2]).
+
+%% gen_statem api
+
 -export([handle_event/4]).
 -export([format_status/2]).
 -export([code_change/4]).
@@ -11,61 +18,34 @@
 
 -define(REQUEST_TIMEOUT, 5000).
 
--record(init, {starter :: pid(),
-               accept_ref :: reference(),
-               sock_ref :: non_neg_integer(),
-               spec :: hd_statem_router:spec()}).
-
 -record(hippo, {recv = sync :: {headers, [{binary(), binary()}]} | sync | async,
                 mode = handle_event_function :: gen_statem2:callback_mode(),
                 sock :: port(),
+                ref :: reference(),
                 parser :: hippo_http:parse() | done,
                 conn = close :: close | shutdown | {keep_alive,
                                                     hippo_http:parse()},
                 spec :: hd_statem_router:spec()}).
 
--spec spawn_monitor(LSock, Spec) -> {Pid, Ref} when
-      LSock :: port(),
-      Spec :: hippo_router:spec(),
-      Pid :: pid(),
-      Ref :: reference().
-spawn_monitor(LSock, Spec) ->
-    SRef = make_ref(),
-    Pid = proc_lib:spawn_link(?MODULE, init_it, [SRef, LSock, Spec]),
-    ARef = monitor(process, Pid),
-    _ = Pid ! {ack, SRef, self(), ARef},
-    {Pid, ARef}.
 
--spec init_it(SRef, LSock, Spec) -> no_return when
-      SRef :: reference(),
-      LSock :: port(),
-      Spec :: hippo_router:spec().
-init_it(SRef, LSock, Spec) ->
-    _ = process_flag(trap_exit, true),
-    receive
-        {ack, SRef, Starter, ARef} ->
-           {ok, Ref} = prim_inet:async_accept(LSock, -1),
-            Init = #init{spec=Spec, starter=Starter, accept_ref=ARef,
-                         sock_ref=Ref},
-            Opts = [], % [{debug, [trace]}],
-            gen_statem2:enter_loop(?MODULE, Opts, handle_event_function, accept,
-                                   Init, [])
-    end.
+%% acceptor api
 
-handle_event(info, {inet_async, _, Ref, {ok, Sock}}, accept,
-       #init{sock_ref=Ref, starter=Starter, accept_ref=ARef, spec=Spec}) ->
-    _ = Starter ! {'ACCEPT', ARef},
-    _ = inet_db:register_socket(Sock, inet_tcp),
-    {ok, PeerName} = inet:peername(Sock),
-    {ok, SockName} = inet:sockname(Sock),
-    ok = inet:setopts(Sock, [{active, once}]),
+acceptor_init(SockName, LSock, Spec) ->
+    Ref = monitor(port, LSock),
+    {ok, #{sockname => SockName, ref => Ref, spec => Spec}}.
+
+acceptor_continue(PeerName, Sock, AcceptState) ->
+    #{sockname := SockName, ref := Ref, spec := Spec} = AcceptState,
     Parser = hippo_http:new(SockName, PeerName),
-    HippoData = #hippo{sock=Sock, spec=Spec, parser=Parser},
-    {next_state, await, HippoData};
-handle_event(info, {inet_async, LSock, Ref, {error, Reason}}, accept,
-             #init{sock_ref=Ref}) ->
-    gen_tcp:close(LSock),
-    {stop, {shutdown, {inet, Reason}}};
+    HippoData = #hippo{sock=Sock, ref=Ref, spec=Spec, parser=Parser},
+    gen_statem2:enter_loop(?MODULE, [], handle_event_function, await, HippoData,
+                           []).
+
+acceptor_terminate(_, _) ->
+    ok.
+
+%% gen_statem api
+
 handle_event(info, {tcp, Sock, Data}, await,
              #hippo{sock=Sock, parser=Parser} = HippoData) ->
    case request(hippo_http:parse(Data, Parser), Sock) of

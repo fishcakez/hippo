@@ -57,8 +57,8 @@
                  crlf2 = binary:compile_pattern(<<"\r\n\r\n">>) :: binary:cp(),
                  crlf_semi = binary:compile_pattern([<<"\r\n">>, <<$;>>]) ::
                              binary:cp(),
-                 sockname :: {inet:ip_address(), inet:port_num()},
-                 peername :: {inet:ip_address(), inet:port_num()},
+                 sockname :: acceptor_pool:name(),
+                 peername :: acceptor_pool:name(),
                  max_empty_line = application:get_env(hippo, max_empty_line,
                                                       32),
                  max_request_line = application:get_env(hippo, max_request_line,

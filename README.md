@@ -11,9 +11,12 @@ Build
 Run
 ---
 
+    $ rebar3 shell
+
 ```erlang
  {ok, _} = application:ensure_all_started(hippo),
- {ok, _} = test_pool:start_link(),
- {ok, _} = hippo_listener:start_link(test_pool, 32, [{port, 8000}, {nodelay, true}]),
- ok.
- ```
+ {ok, Pool} = test_pool:start_link(),
+ Opts = [{nodelay, true}, {reuseaddr, true}, {active, once}, {mode, binary}],
+ {ok, Sock} = gen_tcp:listen(8000, Opts),
+ {ok, _} = test_pool:accept_socket(Pool, Sock, 32).
+```
