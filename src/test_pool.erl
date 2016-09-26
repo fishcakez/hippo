@@ -14,10 +14,14 @@ accept_socket(Pool, Sock, NumAcceptors) ->
     acceptor_pool:accept_socket(Pool, Sock, NumAcceptors).
 
 init(_) ->
-    MS = ets:fun2ms(fun(#hippo_request{path=Path, sockname={_, 8001}}) ->
-                            {test_statem, Path};
+    MS = ets:fun2ms(fun(#hippo_request{path=Path, sockname={_, 8002}}) ->
+                            {view_controller,
+                             test_view, Path,
+                             test_controller, <<"Hello World!">>};
+                       (#hippo_request{path=Path, sockname={_, 8001}}) ->
+                            {statem, test_statem, Path};
                        (#hippo_request{path=Path, sockname={_, 8000}}) ->
-                            {test_chunk_statem, Path}
+                            {statem, test_chunk_statem, Path}
                     end),
     {ok, Router} = hippo_router:compile(MS),
     Spec = #{id => hippo_statem,

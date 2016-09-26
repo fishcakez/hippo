@@ -133,10 +133,15 @@ handle_event(info, {tcp_error, Sock, Reason}, await, #hippo{sock=Sock}) ->
     {stop, {shutdown, {inet, Reason}}};
 handle_event(internal, {request, Request, Headers}, await,
              #hippo{spec=Spec} = HippoData) ->
+    NHippoData = HippoData#hippo{recv={headers, Headers}},
     case hippo_router:run(Request, Spec) of
-        {init, _Mod, _Args} = Init ->
-            {keep_state, HippoData#hippo{recv={headers, Headers}},
-             {next_event, internal, Init}};
+        {statem, Mod, Args} ->
+            {keep_state, NHippoData,
+             {next_event, internal, {init, Mod, Args}}};
+        {view_controller, VMod, VArgs, CMod, CArgs} ->
+            Args = {VMod, VArgs, CMod, CArgs},
+            {keep_state, NHippoData,
+             {next_event, internal, {init, hippo_vc, Args}}};
         {error, Reason} ->
             {keep_state_and_data,
              {next_event, internal, {error, {hippo_router, Reason}}}}

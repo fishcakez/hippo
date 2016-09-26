@@ -23,15 +23,19 @@ compile(MatchSpec) ->
             {error, bad_match_spec}
     end.
 
--spec run(Request, Spec) -> {ok, Handler} | {error, Reason} when
+-spec run(Request, Spec) -> Statem | ViewController | {error, Reason} when
       Request :: hippo_http:request(),
       Spec :: spec(),
-      Handler :: {Module :: module(), Args :: any(), Opts :: list()},
+      Statem :: {statem, Module :: module(), Args :: any()},
+      ViewController :: {view_controller, VModule :: module(), VArgs :: any(),
+                         CModule :: module(), CArgs :: any()},
       Reason :: not_found | {bad_handler, Other :: any}.
 run(Request, #spec{request_cms=CMS}) ->
-   case ets:match_spec_run([Request], CMS) of
-        [{Mod, Args}] ->
-            {init, Mod, Args};
+    case ets:match_spec_run([Request], CMS) of
+        [{statem, _Mod, _Args} = Statem] ->
+            Statem;
+        [{view_controller, _VMod, _VArgs, _CMod, _CArgs} = Controller] ->
+            Controller;
         [] ->
             {error, not_found};
         [Other] ->
