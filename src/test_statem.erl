@@ -1,6 +1,6 @@
 -module(test_statem).
 
--behaviour(gen_statem).
+-behaviour(hippo_statem).
 
 -export([init/1]).
 -export([callback_mode/0]).
@@ -13,12 +13,12 @@ init(Path) ->
                {<<"content-type">>, <<"text/plain">>}],
     Body = <<"Hello World!">>,
     {ok, send, Path,
-     {next_event, internal, {hippo_send_response, 200, Headers, Body}}}.
+     {next_event, hippo, {send_response, 200, Headers, Body}}}.
 
 callback_mode() ->
     state_functions.
 
-send(_, hippo_sent_response, _) ->
+send(http, sent_response, _) ->
     stop.
 
 code_change(_, State, StateData, _) ->

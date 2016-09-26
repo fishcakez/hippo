@@ -1,6 +1,6 @@
 -module(test_chunk_statem).
 
--behaviour(gen_statem).
+-behaviour(hippo_statem).
 
 -define(TIMEOUT, 5000).
 
@@ -14,30 +14,28 @@
 
 init(Path) ->
     {ok, headers, Path,
-     {next_event, internal, {hippo_recv, ?TIMEOUT}}}.
+     {next_event, hippo, {recv, ?TIMEOUT}}}.
 
 callback_mode() ->
     state_functions.
 
-headers(_, {hippo_recv_headers,  _Headers}, StateData) ->
-    {next_state, recv, StateData,
-     {next_event, internal, {hippo_recv, async}}}.
+headers(http, {headers,  _Headers}, StateData) ->
+    {next_state, recv, StateData, {next_event, hippo, {recv, async}}}.
 
-recv(_, {hippo_recv_chunk, _Chunk},  _) ->
-    {keep_state_and_data,
-     {next_event, internal, {hippo_recv, async}}};
-recv(_, hippo_recv_done, StateData) ->
+recv(http, {chunk, _Chunk},  _) ->
+    {keep_state_and_data, {next_event, hippo, {recv, async}}};
+recv(http, done, StateData) ->
     Headers = [{<<"server">>, <<"Hippo">>}],
     {next_state, send, StateData,
-     {next_event, internal, {hippo_send_response, 200, Headers, chunk}}}.
+     {next_event, hippo, {send_response, 200, Headers, chunk}}}.
 
-send(_, hippo_sent_response, _) ->
+send(http, sent_response, _) ->
     {keep_state_and_data,
-     [{next_event, internal, {hippo_send_chunk, <<"Hello ">>}},
-      {next_event, internal, {hippo_send_last_chunk, <<"World!">>}}]};
-send(_, hippo_sent_chunk, _) ->
+     [{next_event, hippo, {send_chunk, <<"Hello ">>}},
+      {next_event, hippo, {send_last_chunk, <<"World!">>}}]};
+send(http, sent_chunk, _) ->
     keep_state_and_data;
-send(_, hippo_sent_last_chunk, _) ->
+send(http, sent_last_chunk, _) ->
     stop.
 
 code_change(_, State, StateData, _) ->
