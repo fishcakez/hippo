@@ -443,9 +443,9 @@ handle_event_function(Other, Mod, State, StateData, HippoData) ->
     common_state(Other, Mod, State, StateData, HippoData).
 
 common_state({keep_state, StateData}, _, _, _, HippoData) ->
-    {keep_state, {HippoData, StateData}};
+    {keep_state, {StateData, HippoData}};
 common_state({keep_state, StateData, Actions}, _, _, _, HippoData) ->
-    {keep_state, {HippoData, StateData}, actions(Actions)};
+    {keep_state, {StateData, HippoData}, actions(Actions)};
 common_state(stop, Mod, State, StateData, HippoData) ->
     {next_state, {terminate, Mod, State}, {StateData, HippoData},
      {next_event, internal, {terminate, normal}}};
@@ -453,7 +453,7 @@ common_state({stop, normal, StateData}, Mod, State, _, HippoData) ->
    {next_state, {terminate, Mod, State}, {StateData, HippoData},
      {next_event, internal, {terminate, normal}}};
 common_state({stop, _, StateData} = Result, _, _, _, HippoData) ->
-    setelement(3, Result, {HippoData, StateData});
+    setelement(3, Result, {StateData, HippoData});
 common_state({stop_and_reply, normal, Replies}, Mod, State, StateData,
              HippoData) ->
     reply_then_stop(Replies, Mod, State, StateData, HippoData);
@@ -461,7 +461,7 @@ common_state({stop_and_reply, normal, Replies, StateData}, Mod, State, _,
              HippoData) ->
     reply_then_stop(Replies, Mod, State, StateData, HippoData);
 common_state({stop_and_reply, _, _, StateData} = Result, _, _, _, HippoData) ->
-    setelement(4, Result, {HippoData, StateData});
+    setelement(4, Result, {StateData, HippoData});
 common_state({keep_state_and_data, Actions}, _, _, _, _) ->
     {keep_state_and_data, actions(Actions)};
 common_state(Other, _, _, _, _) ->
